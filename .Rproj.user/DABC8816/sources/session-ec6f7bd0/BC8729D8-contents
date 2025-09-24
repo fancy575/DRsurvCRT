@@ -1,0 +1,42 @@
+#' @useDynLib DRsurvCRT, .registration = TRUE
+#' @importFrom Rcpp sourceCpp
+#' @importFrom stats coef qnorm quantile
+#' @importFrom survival coxph Surv
+#' @importFrom frailtyEM emfrail emfrail_dist emfrail_control
+.validate_probs <- function(trt_prob1, trt_prob0, tol = 1e-8) {
+  stopifnot(length(trt_prob1) == 1L, length(trt_prob0) == 1L)
+  if (!is.finite(trt_prob1) || !is.finite(trt_prob0) || trt_prob1 <= 0 || trt_prob1 >= 1 || trt_prob0 <= 0 || trt_prob0 >= 1)
+    stop("trt_prob1 and trt_prob0 must be finite scalars in (0,1).", call. = FALSE)
+  if (abs(trt_prob1 + trt_prob0 - 1) > tol)
+    stop("trt_prob1 + trt_prob0 must equal 1.", call. = FALSE)
+  invisible(TRUE)
+}
+
+
+.check_S_warn <- function(S, name = "S", cols = c(1, 2)) {
+  if (!is.matrix(S)) {
+    warning(sprintf("%s should be a numeric matrix [S1, S0, diff].", name), call. = FALSE)
+    return(invisible(FALSE))
+  }
+  cols <- cols[cols %in% seq_len(ncol(S))]
+  if (!length(cols)) return(invisible(TRUE))
+  zero_prop <- vapply(cols, function(j) mean(S[, j] == 0, na.rm = TRUE), numeric(1))
+  if (any(zero_prop >= 0.5)) {
+    bad <- cols[zero_prop >= 0.5]
+    warning(sprintf("%s validity: column(s) %s have ≥ 50%% zeros; downstream RMST/SPCE may be unstable.",
+                    name, paste(bad, collapse = ", ")), call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+
+.compute_trt_probs <- function(data, trt, strata) {
+  cluster_ids <- unique(data[[strata]])
+  A_first <- vapply(cluster_ids, function(g) {
+    idx <- which(data[[strata]] == g)[1]
+    data[[trt]][idx]
+  }, numeric(1))
+  tab <- prop.table(table(A_first))
+  if (length(tab) != 2L) stop("Treatment must be binary at cluster level.", call. = FALSE)
+  c(p0 = as.numeric(tab[1]), p1 = as.numeric(tab[2]))
+}

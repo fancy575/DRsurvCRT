@@ -1,0 +1,14 @@
+writeLines(c(
+  "useDynLib(DRsurvCRT, .registration = TRUE)",
+  "importFrom(Rcpp, sourceCpp)",
+  "importFrom(stats, coef, qnorm, quantile)",
+  "importFrom(survival, coxph, Surv)",
+  "importFrom(frailtyEM, emfrail, emfrail_dist, emfrail_control)",
+  "",
+  "export(DRsurvfit)",
+  "S3method(summary,DRsurvfit)",
+  "S3method(plot,DRsurvfit)"
+), "NAMESPACE")
+
+file.exists("NAMESPACE")   # should be TRUE
+
