@@ -243,7 +243,7 @@ summary.DRsurvfit <- function(object, digits = 4, times = NULL, alpha = 0.05, ..
     cat("Cluster id col:  ", object$cluster_col, "\n", sep = "")
   }
   if (!is.null(object$n_clusters)) {
-    cat("Clusters (K):    ", object$n_clusters, "\n", sep = "")
+    cat("Clusters (M):    ", object$n_clusters, "\n", sep = "")
   }
   if (!is.null(object$n_obs)) {
     cat("Obs (N):         ", object$n_obs, "\n", sep = "")
