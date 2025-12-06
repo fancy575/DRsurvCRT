@@ -1,0 +1,296 @@
+#' Doubly-robust survival estimation for CRTs (SPCE or RMST)
+#'
+#' @description
+#' Fits doubly-robust estimators for cluster-randomized trials with right-censored
+#' outcomes. SPCE is returned on the **full event-time grid**. RMST is returned at
+#' user-specified `tau` (vector). Jackknife variance uses a **shared** event-time grid
+#' across leave-one-cluster-out fits and **reuses** RMST-at-τ computed in the core.
+#'
+#' @param data A data.frame.
+#' @param formula Outcome model: e.g., \code{Surv(time, event) ~ W1 + W2 + Z1 + Z2 + cluster(M)}.
+#'   - For \code{method = "frailty"}, a \code{cluster(<id>)} term is **required** (or supply \code{strata=}).
+#'   - For \code{method = "marginal"}, the cluster term is optional; if you also pass \code{strata=},
+#'     \code{cluster(strata)} is appended to both outcome and censoring formulas.
+#' @param cens_formula Optional censoring model. If \code{NULL}, reuse the RHS (without \code{cluster()})
+#'   and set LHS to \code{Surv(time, event == 0)}. If a cluster id is known, it is appended
+#'   as \code{+ cluster(id)}.
+#' @param intv Character: cluster-level treatment column (0/1), constant within cluster.
+#' @param method \code{"marginal"} or \code{"frailty"}.
+#' @param estimand \code{"SPCE"} or \code{"RMST"}.
+#' @param tau Numeric vector of RMST landmark times (required for RMST).
+#' @param trt_prob Optional length-2 numeric \code{(p0, p1)}. If \code{NULL}, computed from first row per cluster.
+#' @param variance \code{"none"} or \code{"jackknife"}.
+#' @param fit_controls Optional \code{frailtyEM::emfrail_control()} list (frailty method).
+#' @param strata Optional cluster id column name to use if the outcome formula does not include \code{cluster()}.
+#' @param spce_summary_times Optional numeric vector of times to show in \code{summary()} for SPCE.
+#' @param verbose Logical.
+#'
+#' @return An object of class \code{DRsurvfit}.
+#'
+#' @examples
+#' \dontrun{
+#' data(dat)
+#' # SPCE on full grid
+#' fit_spce <- DRsurvfit(
+#'   dat,
+#'   survival::Surv(time, event) ~ W1 + W2 + Z1 + Z2 + cluster(M),
+#'   intv = "A",
+#'   method = "marginal",
+#'   estimand = "SPCE"
+#' )
+#' summary(fit_spce)
+#' plot(fit_spce, level = "cluster")
+#'
+#' # RMST at tau = (0.5, 1, 2) with jackknife variance
+#' fit_rmst <- DRsurvfit(
+#'   dat,
+#'   survival::Surv(time, event) ~ W1 + W2 + Z1 + Z2 + cluster(M),
+#'   intv = "A",
+#'   method = "frailty",
+#'   estimand = "RMST",
+#'   tau = c(0.5, 1, 2),
+#'   variance = "jackknife"
+#' )
+#' summary(fit_rmst)
+#' }
+#' @export
+DRsurvfit <- function(data,
+                      formula,
+                      cens_formula = NULL,
+                      intv,
+                      method   = c("marginal", "frailty"),
+                      estimand = c("SPCE", "RMST"),
+                      tau = NULL,
+                      trt_prob = NULL,
+                      variance = c("none","jackknife"),
+                      fit_controls = NULL,
+                      strata = NULL,
+                      spce_summary_times = NULL,
+                      verbose = FALSE) {
+
+  method   <- match.arg(method)
+  estimand <- match.arg(estimand)
+  variance <- match.arg(variance)
+  if (!is.data.frame(data)) stop("'data' must be a data.frame.", call. = FALSE)
+
+  # fit core on full grid; pass tau so core also returns RMST-at-τ (if any)
+  est <- .DR_est_core(
+    data = data, formula = formula, cens_formula = cens_formula, intv = intv,
+    method = method, trt_prob = trt_prob, fit_controls = fit_controls,
+    e_time = NULL, strata = strata, tau = if (estimand == "RMST") tau else NULL
+  )
+
+  et   <- est$event_time
+  S_cl <- est$S_cluster_full
+  S_in <- est$S_ind_full
+
+  if (estimand == "SPCE") {
+    var_out <- if (variance == "jackknife") {
+      .DR_var_jackknife(
+        data, formula, cens_formula, intv, method,
+        trt_prob, e_time_full = et, tau = NULL,
+        strata = est$cluster_col, estimand = "SPCE"
+      )
+    } else NULL
+
+    ans <- list(
+      method   = method,
+      estimand = "SPCE",
+      event_time      = et,
+      S_full_cluster  = S_cl,
+      S_full_ind      = S_in,
+      S_cluster       = S_cl,
+      S_individual    = S_in,
+      RMST_cluster    = NULL,
+      RMST_ind        = NULL,
+      trt_prob        = unname(est$trt_prob),
+      var_cluster     = if (!is.null(var_out)) var_out$Cluster else NULL,
+      var_ind         = if (!is.null(var_out)) var_out$Individual else NULL,
+      spce_summary_times = spce_summary_times
+    )
+
+  } else {
+    if (is.null(tau) || !length(tau) || any(!is.finite(tau)))
+      stop("'tau' must be a non-empty numeric vector for RMST.", call. = FALSE)
+
+    R_cl <- est$RMST_tau_cluster
+    R_in <- est$RMST_tau_ind
+    rownames(R_cl) <- rownames(R_in) <- tau
+
+    var_out <- if (variance == "jackknife") {
+      .DR_var_jackknife(
+        data, formula, cens_formula, intv, method,
+        trt_prob, e_time_full = et, tau = tau,
+        strata = est$cluster_col, estimand = "RMST"
+      )
+    } else NULL
+
+    ans <- list(
+      method   = method,
+      estimand = "RMST",
+      event_time      = et,
+      S_full_cluster  = S_cl,
+      S_full_ind      = S_in,
+      S_cluster       = NULL,
+      S_individual    = NULL,
+      RMST_cluster    = R_cl,
+      RMST_ind        = R_in,
+      trt_prob        = unname(est$trt_prob),
+      var_cluster     = if (!is.null(var_out)) var_out$Cluster else NULL,
+      var_ind         = if (!is.null(var_out)) var_out$Individual else NULL,
+      tau             = tau
+    )
+  }
+
+  class(ans) <- "DRsurvfit"
+  ans
+}
+
+# ---- S3: summary -------------------------------------------------------------
+
+#' Summary method for DRsurvfit objects
+#'
+#' @description
+#' For \strong{SPCE}, prints survival contrasts \eqn{(S_1,S_0,S_1-S_0)} at either
+#' user-specified \code{times} or default grid quantiles (~10/25/50/75%).
+#' For \strong{RMST}, prints \eqn{(R_1,R_0,R_1-R_0)} at the requested \code{tau}.
+#'
+#' @param object A \code{DRsurvfit} object.
+#' @param digits Number of digits to print.
+#' @param times Optional numeric times for SPCE summary (ignored for RMST).
+#' @param ... Unused.
+#'
+#' @return The input object (invisibly).
+#'
+#' @examples
+#' \dontrun{
+#' data(dat)
+#' fit <- DRsurvfit(
+#'   dat, survival::Surv(time, event) ~ W1 + W2 + Z1 + Z2 + cluster(M),
+#'   intv = "A", method = "marginal", estimand = "SPCE"
+#' )
+#' summary(fit, digits = 3)
+#' }
+#' @export
+summary.DRsurvfit <- function(object, digits = 4, times = NULL, ...) {
+  # pretty headers
+  cat(sprintf("DRsurvfit: method = %s, estimand = %s\n", object$method, object$estimand))
+  cat("Treatment probs (p0, p1): ",
+      paste(signif(object$trt_prob, digits), collapse = ", "), "\n", sep = "")
+
+  # echo model formulas if they were stored in the fit object
+  # (recommended: save these in DRsurvfit() as `object$formula` and `object$cens_formula`)
+  if (!is.null(object$formula)) {
+    cat("Outcome model:   ", deparse(object$formula), "\n", sep = "")
+  }
+  if (!is.null(object$cens_formula)) {
+    cat("Censoring model: ", deparse(object$cens_formula), "\n", sep = "")
+  }
+  cat("\n")
+
+  # helper to round + set colnames safely
+  tidy_print <- function(mat, rn = NULL, cols = NULL) {
+    if (!is.null(cols) && (is.null(colnames(mat)) || any(colnames(mat) == ""))) {
+      colnames(mat) <- cols
+    }
+    if (!is.null(rn)) rownames(mat) <- rn
+    print(round(mat, digits))
+  }
+
+  if (object$estimand == "SPCE") {
+    et <- object$event_time
+    # choose times to display
+    show_times <- times
+    if (is.null(show_times) && !is.null(object$spce_summary_times))
+      show_times <- object$spce_summary_times
+    if (is.null(show_times)) {
+      qs <- stats::quantile(et, probs = c(0.10, 0.25, 0.50, 0.75), type = 1)
+      show_times <- as.numeric(qs)
+    }
+    idx <- pmax(1L, findInterval(show_times, et))
+    rown <- paste0("t=", signif(et[idx], digits))
+
+    # cluster level
+    if (!is.null(object$S_cluster)) {
+      cat("Cluster-level SPCE at selected times:\n")
+      out <- object$S_cluster[idx, , drop = FALSE]
+      tidy_print(out, rn = rown, cols = c("S1","S0","S1-S0"))
+      cat("\n")
+    }
+
+    # individual level
+    if (!is.null(object$S_individual)) {
+      cat("Individual-level SPCE at selected times:\n")
+      out <- object$S_individual[idx, , drop = FALSE]
+      tidy_print(out, rn = rown, cols = c("S1","S0","S1-S0"))
+      cat("\n")
+    }
+
+  } else { # RMST
+    rown <- NULL
+    if (!is.null(object$landmarks)) {
+      rown <- paste0("tau=", signif(as.numeric(object$landmarks), digits))
+    } else if (!is.null(object$tau)) {
+      rown <- paste0("tau=", signif(as.numeric(object$tau), digits))
+    }
+
+    cat("Cluster-level RMST at tau:\n")
+    tidy_print(object$RMST_cluster, rn = rown, cols = c("R1","R0","R1-R0"))
+    cat("\nIndividual-level RMST at tau:\n")
+    tidy_print(object$RMST_ind, rn = rown, cols = c("R1","R0","R1-R0"))
+    cat("\n")
+  }
+
+  invisible(object)
+}
+
+# ---- S3: plot ---------------------------------------------------------------
+
+#' Plot method for DRsurvfit objects
+#'
+#' @description
+#' Plots survival curves (treatment \code{S1} solid, control \code{S0} dashed)
+#' for either the cluster- or individual-level estimand. If \code{tau} is present
+#' (RMST fit), vertical lines are drawn at \code{tau}.
+#'
+#' @param x A \code{DRsurvfit} object.
+#' @param level \code{"cluster"} or \code{"individual"}.
+#' @param ... Unused.
+#'
+#' @return The input object \code{x} (invisibly).
+#'
+#' @examples
+#' \dontrun{
+#' data(dat)
+#' fit_spce <- DRsurvfit(
+#'   dat, survival::Surv(time, event) ~ W1 + W2 + Z1 + Z2 + cluster(M),
+#'   intv = "A", method = "marginal", estimand = "SPCE"
+#' )
+#' plot(fit_spce, level = "cluster")
+#'
+#' fit_rmst <- DRsurvfit(
+#'   dat, survival::Surv(time, event) ~ W1 + W2 + Z1 + Z2 + cluster(M),
+#'   intv = "A", method = "frailty", estimand = "RMST", tau = c(0.5,1,2)
+#' )
+#' plot(fit_rmst, level = "individual")
+#' }
+#' @export
+plot.DRsurvfit <- function(x, level = c("cluster", "individual"), ...) {
+  level <- match.arg(level)
+  mat <- if (level == "cluster") x$S_full_cluster else x$S_full_ind
+  if (is.null(mat)) {
+    warning("No survival curves available to plot.", call. = FALSE)
+    return(invisible(x))
+  }
+  yy1 <- mat[, 1L]; yy0 <- mat[, 2L]
+  plot(x$event_time, yy1, type = "l", xlab = "time", ylab = "Survival",
+       main = sprintf("%s-level survival curves (%s)", level, x$method))
+  lines(x$event_time, yy0, lty = 2)
+  legend("topright", legend = c("Treatment (S1)","Control (S0)"), lty = c(1,2), bty = "n")
+
+  # draw tau if present (RMST)
+  tau <- x$tau %||% NULL
+  if (!is.null(tau)) abline(v = tau, lty = 3)
+
+  invisible(x)
+}

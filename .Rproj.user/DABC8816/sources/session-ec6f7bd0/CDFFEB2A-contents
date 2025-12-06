@@ -1,0 +1,328 @@
+library(stabledist)  # for rstable
+library(dplyr)
+library(gumbel)
+library(Rcpp)
+library(stats)
+
+sourceCpp("wr_cpp.cpp")
+sourceCpp("prob_cal.cpp")
+
+
+
+pos_stable <- function(alpha) {
+  # alpha in (0, 1).
+  # 1) Draw U ~ Uniform(0, pi) and E ~ Exp(1).
+  U <- runif(1, 0, pi)
+  E <- rexp(1)
+  
+  # 2) Define A(u) = [ (sin(alpha*u))^alpha * (sin((1-alpha)*u))^(1-alpha ) / sin(u) ]^(1/(1-alpha)).
+  A_u <- (
+    (sin(alpha * U))^alpha *
+      (sin((1 - alpha) * U))^(1 - alpha) /
+      sin(U)
+  )^(1 / (1 - alpha))
+  
+  # 3) Combine with E via an exponent so that W ~ stable(alpha).
+  W <- (A_u/E)^((1-alpha)/alpha )
+  
+  return(W)
+}
+
+
+
+gen_surv <- function(M = 50, # number of cluster
+                     nl = 20, nu=100, ## cluster size from uniform distribution with lower bound nl, upper bound nu,
+                     fb = 2, # frailty for each cluster is from gamma distribution Gamma(shape=fb,scale=fb),
+                     lh = 0.1, # baseline hazard for hospitalization
+                     ld=0.08, # baseline hazard for death
+                     lc = 0.09, # baseline hazard for censoring
+                     eh = 0.3, # hazard ratio for treatment with hospitalization
+                     ed = 0.3, # hazard ratio for treatment with death
+                     ec = 0.1, # hazard ratio for treatment with censoring
+                     phi = 2 # copula power (Gumbel-copula)
+){
+  
+  z <- rep(0, M)
+  indices <- sample(seq_len(M), size = M / 2)
+  z[indices] <- 1
+  g <- rgamma(M,shape=fb,rate=fb)
+  
+  haz_H <- g * lh * exp(-eh * z)
+  haz_D <- g * ld * exp(-ed * z)
+  
+  Nc <- floor(runif(M,nl,nu))
+  
+  
+  # List to hold results for each cluster
+  cluster_list <- vector("list", M)
+  
+  for (i in 1:M) {
+    n_i <- Nc[i]
+    t_H_vec <- numeric(n_i)
+    t_D_vec <- numeric(n_i)
+    
+    for (j in 1:n_i) {
+      # Generate latent variable W using stabledist for the Gumbel copula
+      W <- pos_stable(1/phi)
+      
+      # Generate two independent exponential random variables (rate = 1)
+      E_H <- rexp(1, rate = 1)
+      E_D <- rexp(1, rate = 1)
+      
+      # 3. Generate dependent uniforms using invphigumbel()
+      U_H <- invphigumbel(E_H / W, phi)  # returns exp(- (E_H/W)^(1/phi) )
+      U_D <- invphigumbel(E_D / W, phi)
+      
+      # Compute event times for hospitalization and fatality
+      t_H_vec[j] <- -log(U_H) / haz_H[i] 
+      t_D_vec[j] <- -log(U_D) / haz_D[i]
+    }
+    
+    # Create a data frame for the current cluster
+    cluster_list[[i]] <- data.frame(
+      cluster = rep(i, n_i),
+      Nc = rep(n_i, n_i),
+      t_H = t_H_vec,
+      t_D = t_D_vec,
+      z = z[i]
+    )
+  }
+  
+  # Combine all clusters into one data frame
+  t_df <- do.call(rbind, cluster_list)
+  t_df$id <- 1:nrow(t_df)
+  
+  haz_C <- lc * exp(-ec * t_df$z)
+  
+  t_df$t_C <- rexp(nrow(t_df), rate = haz_C)
+  
+  # --- Transformation to long format using dplyr ---
+  t_df <- t_df %>% 
+    mutate(second_time = pmin(t_D, t_C),
+           second_event = if_else(t_D < t_C, 2L, 0L),
+           hosp_first = t_H < second_time)
+  
+  # Create the first record (hospitalization event) for individuals with t_H < min(t_D, t_C)
+  first_record <- t_df %>% 
+    filter(hosp_first) %>% 
+    transmute(id, cluster, Nc, time = t_H,z=z ,event = 1L)
+  
+  # Create the second record (the subsequent event) for all individuals
+  second_record <- t_df %>% 
+    transmute(id, cluster, Nc, time = second_time, event = second_event,z=z)
+  
+  long_df <- bind_rows(first_record, second_record) %>% 
+    arrange(id, time,z)
+  
+  return(long_df)
+  
+  
+}
+
+
+WR_cal <- function(data,
+                   time    = "time",
+                   event   = "event",
+                   cluster = "cluster",
+                   id      = "id",
+                   trt     = "z") {
+  
+  # 1) One‐row per subject, get min times by event
+  dt <- data %>%
+    rename(
+      time    = !!sym(time),
+      event   = !!sym(event),
+      cluster = !!sym(cluster),
+      id      = !!sym(id),
+      trt     = !!sym(trt)
+    ) %>%
+    group_by(id, cluster) %>%
+    summarise(
+      trt = first(trt),
+      Nc  = first(Nc),
+      T_H = min(time[event == 1], default = Inf),
+      T_C = min(time[event == 0], default = Inf),
+      T_D = min(time[event == 2], default = Inf),
+      .groups = "drop"
+    ) %>% as.data.frame()
+  
+  n <- nrow(dt)
+  if(n < 2) stop("Need at least 2 subjects")
+  
+  # 2) Call C++ for pairwise w, l, total ties t_all, and cross‐arm ties tie_diff
+  tmp      <- wr_cpp(dt$T_D, dt$T_H, dt$T_C, as.integer(dt$trt))
+  w        <- tmp[1:n]
+  l        <- tmp[n + 1:n]
+  t_all    <- tmp[2*n + 1:n]
+  tie_diff <- tmp[3*n + 1:n]
+  
+  dt <- dt %>% mutate(w = w,
+                      l = l,
+                      t = t_all,
+                      tie_diff = tie_diff)
+  
+  dt <- dt %>% mutate(rank = w + 1 + t/2)
+
+  # 4) Cross‐arm tie count and FS statistic
+  ti        <- which(dt$trt == 1)
+  ci        <- which(dt$trt == 0)
+  ties_cnt  <- sum(dt$tie_diff[ti])
+  N_T       <- length(ti)
+  N_C       <- length(ci)
+  T0        <- N_T * N_C
+  
+  W_D  <- sum((dt$w - dt$l)[ti])
+  Wval <- (T0 - ties_cnt + W_D) / 2
+  Lval <- (T0 - ties_cnt - W_D) / 2
+  logW_R <- log(Wval / Lval)
+  
+  # 5) Direct‐FS variance
+  S_i       <- dt %>% group_by(cluster) %>% summarise(S = sum(w - l), .groups="drop") %>% pull(S)
+  M1        <- sum(distinct(dt, cluster, trt)$trt == 1)
+  M0        <- sum(distinct(dt, cluster, trt)$trt == 0)
+  M         <- M1 + M0
+  VarWD     <- (M1 * M0 / M^2) * sum(S_i^2)
+  D0        <- T0 - ties_cnt
+  var_direct <- (2 / D0)^2 * VarWD
+  
+
+  # 6) Empirical variance
+  Nc_vec    <- dt %>% distinct(cluster, Nc) %>% pull(Nc)
+  mu1 <- mean(Nc_vec); mu2 <- mean(Nc_vec^2)
+
+  
+  # Compute ICC
+  dt$weight <- 1/n
+  F_bar <- mean(dt$rank)
+  denom <- sum(dt$weight * (dt$rank - F_bar)^2)
+
+  rank_sum <- dt %>% group_by(cluster) %>%
+    summarise(
+      product = 2 * sum(combn(rank - F_bar, 2, prod)) / (n() * (n() - 1)) * sum(weight),
+      .groups = "drop"
+    )
+  gamma_I <- sum(rank_sum$product) / denom
+
+  
+  # cluster‐size summaries (you already have mu1 and mu2)
+  mu_N   <- mu1
+  CV     <- sqrt(mu2 - mu1^2) / mu1
+  EN     <- M * mu_N
+  sum_N2 <- mu_N^2 * ( M + (M - 1) * CV^2 )
+  
+  plist <- compute_p_values(dt$T_D, dt$T_H, dt$T_C)
+  p_W  <- plist$p_W;  p_T  <- plist$p_T
+  p_WW <- plist$p_WW; p_WT <- plist$p_WT; p_TT <- plist$p_TT
+  p_ties <- ties_cnt/(N_C*N_T)
+  q <- M1 / M
+  
+  ## Theretical variance
+  P <- 3 * p_W + 5/4 * p_T
+  Q <- p_WW + p_WT + 1/4 * p_TT
+  
+  # 2) G = γ_I μ_N^2 [M + (M−1) CV^2] + (1−γ_I) EN
+  G <- gamma_I * mu_N^2 * (M + (M - 1) * CV^2) +
+    (1 - gamma_I) * EN
+  
+  # 3) the bracket term T = 4{1 + (EN−1)P + (EN−1)(EN−2)Q} − (EN+1)^2
+  T_in <- 4 * (1 + (EN - 1) * P + (EN - 1) * (EN - 2) * Q) -
+    (EN + 1)^2
+  
+  # 4) Var[log W_R] per the Lemma:
+  var_theorem <- (4 * T_in * G) /
+    ( q * (1 - q) * M^4 * mu_N^4 * (1 - p_ties)^2 )
+  
+
+  list(
+    W_D        = W_D,
+    W_R        = exp(logW_R),
+    logW_R     = logW_R,
+    p_ties     = p_ties,
+    p_list = plist,
+    gamma_I    = gamma_I,
+    var_direct = var_direct,
+    var_theorem = var_theorem
+  )
+}
+
+
+# 1) updated empirical_power() using the Lemma‐style σ_c^2
+empirical_power <- function(
+    M,         # # of clusters
+    mu_N,      # E[N_i], mean cluster size
+    CV,        # coefficient of variation of N_i
+    p_W, p_T,  # P(i beats j), P(i ties j)
+    p_WW, p_WT, p_TT,   # P(beats both), P(beat & tie), P(both ties)
+    p_ties,    # overall tie probability
+    gamma_I,   # ICC = corr[R_ij, R_ik]
+    delta,     # true effect under H1: log(WR), log(WO), or WD (depending on 'type')
+    q = 0.5,   # fraction of clusters treated
+    alpha = 0.05, # two-sided level
+    type = c("WR","WO","WD")  # estimand: Win Ratio (log), Win Odds (log), or Win Difference
+){
+  type <- match.arg(type)
+  
+  # Derived quantities
+  EN <- M * mu_N
+  
+  # P, Q per Lemma
+  P <- 3 * p_W + 5/4 * p_T
+  Q <- p_WW + p_WT + 1/4 * p_TT
+  
+  # G = γ_I μ_N^2 [M + (M−1) CV^2] + (1−γ_I) EN
+  G <- gamma_I * mu_N^2 * (M + (M - 1) * CV^2) +
+    (1 - gamma_I) * EN
+  
+  # T = 4{1 + (EN−1)P + (EN−1)(EN−2)Q} − (EN+1)^2
+  T_term <- 4 * (1 + (EN - 1) * P + (EN - 1) * (EN - 2) * Q) -
+    (EN + 1)^2
+  
+  # Variance by estimand
+  if (type == "WR") {
+    # Var[log WR] = (4 * T * G) / [ q(1-q) * M^4 * mu_N^4 * (1 - p_ties)^2 ]
+    var_delta <- (4 * T_term * G) /
+      ( q * (1 - q) * M^4 * mu_N^4 * (1 - p_ties)^2 )
+  } else if (type == "WO") {
+    # Var[log WO] = (4 * T * G) / [ q(1-q) * M^4 * mu_N^4 ]
+    var_delta <- (4 * T_term * G) /
+      ( q * (1 - q) * M^4 * mu_N^4 )
+  } else { # type == "WD"
+    # Var[WD] = q(1-q) * T * G
+    var_delta <- q * (1 - q) * T_term * G
+  }
+  
+  se_delta <- sqrt(var_delta)
+  
+  # two-sided power with z-test
+  zcrit <- qnorm(1 - alpha/2)
+  lam   <- delta / se_delta
+  power <- pnorm(lam - zcrit) + pnorm(-lam - zcrit)
+  return(power)
+}
+
+
+
+# 2) sample‐size solver: find smallest M giving at least target_power
+required_sample_size <- function(
+    target_power,
+    mu_N, CV,
+    p_W, p_T, p_WW, p_WT, p_TT, p_ties,
+    gamma_I, delta,                 # <- was log_WR
+    q = 0.5, alpha = 0.05,
+    M_lower = 4, M_upper = 1e4,
+    type = c("WR","WO","WD")        # <- added
+){
+  type <- match.arg(type)
+  
+  f <- function(M) empirical_power(
+    M, mu_N, CV,
+    p_W, p_T, p_WW, p_WT, p_TT, p_ties,
+    gamma_I, delta,
+    q, alpha, type = type
+  ) - target_power
+  
+  # uniroot on continuous M, then ceiling
+  sol <- uniroot(f, lower = M_lower, upper = M_upper)
+  ceiling(sol$root)
+}
+

@@ -1,0 +1,3 @@
+raw <- readLines("DESCRIPTION", warn = FALSE)
+raw <- gsub("\t", "    ", raw, fixed = TRUE)  # replace tabs with spaces
+writeLines(c(raw, ""), "DESCRIPTION")         # ensure final newline

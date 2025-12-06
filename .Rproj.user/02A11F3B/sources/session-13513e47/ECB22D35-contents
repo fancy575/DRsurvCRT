@@ -1,0 +1,279 @@
+library(Rcpp)
+library(dplyr)
+library(abind)
+library(pracma)
+library(survival)
+sourceCpp("DR_estimate.cpp")
+
+DR_S_est <- function(surv_dt, etime="obs_T",status = "Delta",
+                       id = "id",
+                       trt = "A",
+                       censor_cov=c("W1","W2","Z1","Z2"), ## covariates for censoring probability
+                       surv_cov=c("W1","W2","Z1","Z2"), ## covariates for probability in augmentation
+                       strata="M",## target treatment group for the estimates
+                       prop1=0.5, prop0=0.5,
+                       tau
+                       #RMST_target_time = c(0.1,0.2,0.5,1,2),
+                       ){
+  
+  
+  cluster_grp <- unique(surv_dt[,strata])
+  max_s <- max(surv_dt[,status]) ## number of status
+  
+  surv_dt <- surv_dt %>%
+  arrange(across(all_of(c(id,etime))))
+  
+  all_etime <- unique(surv_dt$obs_T)
+  all_etime <- all_etime[order(all_etime)]
+  all_etime <- all_etime[which(all_etime < max(tau))]
+  
+  
+  S_c <- array(dim = c(length(all_etime),2,max_s )) 
+  S_i <- array(dim = c(length(all_etime),2,max_s )) 
+  
+
+  for(s in 1:max_s){
+    sub_dat <- surv_dt %>%
+      filter(.data[[status]] == 0 | .data[[status]] >= s) %>%  # Filter rows where status == 0 or status >= s
+      mutate(event = if_else(.data[[status]] != 0, 1, 0)) %>%  # Create event column after filtering
+      group_by(.data[[id]]) %>%  # Group by the ID column
+      arrange(.data[[etime]]) %>%  # Sort by status and time
+      slice(1) %>%  # Keep the first row in each group
+      ungroup()  # Ungroup the data
+    
+    ## Calculate the estimate and variance for trt=1
+    
+    sub_dat <- as.data.frame(sub_dat)
+    sub_dat <- sub_dat[order(sub_dat[,etime]),]
+    
+    ## Calculate the PH model for the survival probability
+    subset_dt <- sub_dat[which(sub_dat[,trt] == 1),]
+    
+    cox_e_formula <- as.formula(paste("Surv(",etime,",","event",") ~",paste(surv_cov,collapse = "+"),"+cluster(",strata,")" )  )
+    cox_e <- coxph(cox_e_formula,data=subset_dt )
+    
+    
+    
+    cox_c_formula <- as.formula(paste("Surv(",etime,",","event","==0",") ~",paste(censor_cov,collapse = "+"),"+cluster(",strata,")" )  )
+    cox_c <- coxph(cox_c_formula,data=subset_dt)
+    
+    sub_dat0 <- sub_dat
+    sub_dat0[,trt] <- 1-sub_dat0[,trt]
+    
+    ## Calculate the PH model for the survival probability
+    subset_dt0 <- sub_dat0[which(sub_dat0[,trt] == 1),]
+    
+    cox_e0 <- coxph(cox_e_formula,data=subset_dt0)
+    
+    cox_c0 <- coxph(cox_c_formula,data=subset_dt0)
+    
+    
+    DR_est <- DR_estimate(ftime=sub_dat[,etime],delta = sub_dat[,"event"],trt=sub_dat[,trt],
+                          strata = sub_dat[,strata],
+                          trt_prob1 = prop1,trt_prob0 = prop0,
+                          censor_cov = as.matrix(sub_dat[,censor_cov]),
+                          surv_cov = as.matrix(sub_dat[,surv_cov]),
+                          censor_fit1 =cox_c$coefficients,censor_fit0 = cox_c0$coefficients,
+                          surv_fit1 = cox_e$coefficients, surv_fit0 = cox_e0$coefficients,
+                          e_time = all_etime,RMST_cal = F)
+    
+    S_c[,,s] <- DR_est$S_cluster[,1:2]
+    S_i[,,s] <- DR_est$S_individual[,1:2]
+    
+    
+  }
+  
+  
+  return(list(S_c=S_c, S_i=S_i, time = all_etime) )
+  
+  
+}
+
+
+# Function to preprocess S_c and S_i strictly decreasing
+preprocess_S <- function(S) {
+  S <- pmin(pmax(S, 0), 1)  # Clamp values to [0, 1]
+  
+  for (q in 1:dim(S)[3]) {  # Loop over states
+    for (c in 1:dim(S)[2]) {  # Loop over columns
+      for (t in 2:nrow(S)) {  # Loop over time points (start from the second)
+        if (S[t, c, q] > S[t - 1, c, q]) {
+          S[t, c, q] <- S[t - 1, c, q]  # Replace with the previous value
+        }
+      }
+    }
+  }
+  
+  return(S)
+}
+# Interpolate S_c and S_i to include tau
+interpolate_S <- function(S,tau,time) {
+  
+  if(!tau %in% time){
+    interp_time <- c(time[time <= tau], tau)
+    array(apply(S, c(2, 3), function(x) approx(time, x, xout = interp_time, rule = 2)$y),
+          dim = c(length(interp_time), dim(S)[2], dim(S)[3]))
+  }else{
+    interp_time <- c(time[time <= tau])
+    array(apply(S, c(2, 3), function(x) approx(time, x, xout = interp_time, rule = 2)$y),
+          dim = c(length(interp_time), dim(S)[2], dim(S)[3]))
+  }
+
+}
+
+
+# Compute trapezoidal integrals for q = 1:(max_s - 1)
+compute_for_S <- function(S, time) {
+  sapply(1:dim(S)[3], function(q) {
+    if (q == dim(S)[3]) {
+      # For the last slice, set S[,1,q+1] and S[,2,q+1] as 1
+      integral_1 <- trapz(time, S[, 1, q] * 1)
+      integral_2 <- trapz(time, S[, 2, q] * 1)
+    } else {
+      # Regular computation for slices within bounds
+      integral_1 <- trapz(time, S[, 1, q] * S[, 2, q + 1])
+      integral_2 <- trapz(time, S[, 2, q] * S[, 1, q + 1])
+    }
+    c(integral_1, integral_2)
+  })
+}
+
+
+
+## compute integrals
+compute_integrals <- function(S_c, S_i, time, tau) {
+  #if (tau > max(time)) stop("Tau exceeds the maximum time.")
+  S_c <- interpolate_S(preprocess_S(S_c),tau = tau,time = time)
+  S_i <- interpolate_S(preprocess_S(S_i),tau = tau,time = time)
+  
+  if(!tau %in% time ){
+    interp_time <- c(time[time <= tau], tau)
+    
+  }else{
+    interp_time <- time[time <= tau]
+    
+  }
+  
+  Sc_int <- as.data.frame(compute_for_S(S_c,interp_time))
+  Si_int <- as.data.frame(compute_for_S(S_i,interp_time))
+
+  rownames(Sc_int) <- rownames(Si_int) <- c("s1qs0q1","s0qs1q1")
+  colnames(Sc_int) <- colnames(Si_int) <- 1:(dim(S_c)[3])
+  
+  return(list(Sc_int=Sc_int, Si_int = Si_int))
+}
+
+check_S <- function(S, name = "S", tol = 1e-9) {
+  if (!is.array(S) || length(dim(S)) != 3L) {
+    stop(sprintf("%s must be a 3-D array with dims [time, treatment, status].", name))
+  }
+  d <- dim(S)
+  n_time <- d[1]; n_trt <- d[2]; n_status <- d[3]
+  
+  dn <- dimnames(S)
+  trt_names    <- if (!is.null(dn)) dn[[2]] else NULL
+  status_names <- if (!is.null(dn)) dn[[3]] else NULL
+  
+  for (k in seq_len(n_status)) {
+    ## Get time x treatment matrix for status k (ensure it's a matrix)
+    mat_k <- S[, , k, drop = FALSE][, , 1]
+    ## For each treatment arm, count times below tol
+    bad <- colSums(mat_k < tol, na.rm = TRUE) > (n_time / 2)
+    
+    if (any(bad)) {
+      bad_trt_idx <- which(bad)
+      trt_label <- if (!is.null(trt_names)) paste(trt_names[bad_trt_idx], collapse = ", ")
+      else paste(bad_trt_idx, collapse = ", ")
+      status_label <- if (!is.null(status_names)) status_names[k] else as.character(k)
+      
+      stop(sprintf(
+        "%s validity failed: status %s, treatment arm(s) %s have >50%% of time points < %.1e.",
+        name, status_label, trt_label, tol
+      ))
+    }
+  }
+  invisible(TRUE)
+}
+
+
+DR_win_est <- function(surv_dt, etime="obs_T",status = "Delta",
+                       id = "id",
+                       trt = "A",
+                       censor_cov=c("W1","W2","Z1","Z2"), ## covariates for censoring probability
+                       surv_cov=c("W1","W2","Z1","Z2"), ## covariates for probability in augmentation
+                       strata="M", prop1=0.5, prop0=0.5,
+                       tau){
+  
+  raw_est <- DR_S_est(surv_dt,etime,status,id,trt,censor_cov,
+                      surv_cov, strata, prop1, prop0,
+                      tau)
+  
+  time <- raw_est$time
+  S_c = raw_est$S_c
+  S_i <- raw_est$S_i
+  
+  if (!is.null(raw_est$S_c)) check_S(raw_est$S_c, name = "S_c", tol = 1e-9)
+  if (!is.null(raw_est$S_i)) check_S(raw_est$S_i, name = "S_i", tol = 1e-9)
+  
+  
+  time <- c(0, time)  # Add t = 0 at the start
+  max_s <- dim(S_c)[3]
+  S_c <- abind(array(1, dim = c(1, 2, max_s)), S_c, along = 1)
+  S_i <- abind(array(1, dim = c(1, 2, max_s)), S_i, along = 1)
+  
+  stage_wise_results <- lapply(tau, function(t) {
+    compute_integrals(S_c, S_i, time, t)
+  })
+  
+
+  Sc_all <- list(S_c = lapply(tau, function(t) {
+                              S_c[max(which(time <= t)), , ]
+                }),
+                 stage_wise = lapply(stage_wise_results, function(x) x$Sc_int)
+                )
+  
+  Si_all <- list(S_i = lapply(tau, function(t) {
+    S_i[max(which(time <= t)), , ]
+  }),
+  stage_wise = lapply(stage_wise_results, function(x) x$Si_int)
+  )
+  
+  names(Sc_all[[1]]) <- names(Si_all[[1]]) <- names(Sc_all[[2]]) <- names(Si_all[[2]]) <- paste("time",tau,sep="=")
+
+  Sc_all[[1]] <- lapply(Sc_all[[1]], function(matrix_element) {
+    rownames(matrix_element) <- c("trt","ctrl")
+    colnames(matrix_element) <- paste("stage",1:(max_s),sep="_")
+    return(matrix_element)
+  })
+  
+  Si_all[[1]] <- lapply(Si_all[[1]], function(matrix_element) {
+    rownames(matrix_element) <- c("trt","ctrl")
+    colnames(matrix_element) <- paste("stage",1:(max_s),sep="_")
+    return(matrix_element)
+  })
+  
+  Sc_all[[2]] <- lapply(Sc_all[[2]], function(matrix_element) {
+    matrix_element[1,max_s+1] <- sum(matrix_element[1,],na.rm=T)
+    matrix_element[2,max_s+1] <- sum(matrix_element[2,],na.rm=T)
+    matrix_element[3,] <- matrix_element[1,] -  matrix_element[2,]
+    rownames(matrix_element) <- c("s1qs0qp1","s0qs1qp1","diff")
+    colnames(matrix_element) <- c(paste("stage",1:(max_s),sep="_"),"sum")
+    return(matrix_element)
+  })
+  
+  Si_all[[2]] <- lapply(Si_all[[2]], function(matrix_element) {
+    matrix_element[1,max_s+1] <- sum(matrix_element[1,],na.rm=T)
+    matrix_element[2,max_s+1] <- sum(matrix_element[2,],na.rm=T)
+    matrix_element[3,] <- matrix_element[1,] -  matrix_element[2,]
+    rownames(matrix_element) <- c("s1qs0qp1","s0qs1qp1","diff")
+    colnames(matrix_element) <- c(paste("stage",1:(max_s),sep="_"),"sum")
+    return(matrix_element)
+  })
+  
+  
+  return(list(Sc_out= Sc_all , Si_out = Si_all ))
+  
+}
+
+
+

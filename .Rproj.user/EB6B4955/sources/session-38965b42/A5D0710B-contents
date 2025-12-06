@@ -1,0 +1,20 @@
+library(DRsurvCRT)   # or library(DRsurvfit) if that's your final name
+data(dat)
+fit_spce <- DRsurvfit(
+  data    = dat,
+  formula = Surv(time, event) ~ W1 + W2 + Z1 + Z2 + cluster(M),
+  intv    = "A",
+  method  = "marginal",
+  estimand= "RMST",
+  tau=c(0.5,1,1.5),
+  variance = "jackknife"
+)
+
+summary(fit_spce, digits = 3)            # default ~10/25/50/75% grid points
+plot(fit_spce, level = "cluster")        # S1 (solid) vs S0 (dashed)
+plot(fit_spce, level = "individual")
+
+
+usethis::use_data(dats, datm, overwrite = TRUE)
+
+

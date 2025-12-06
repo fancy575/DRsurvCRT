@@ -1,0 +1,54 @@
+#!/usr/bin/env Rscript
+
+TASK_ID <- as.integer(Sys.getenv("SLURM_ARRAY_TASK_ID", "1"))
+NWORKERS <- 1L
+MC_total <- as.integer(Sys.getenv("MC_TOTAL", "1500"))
+
+seed_bases <- c(123)
+base_seed <- seed_bases[TASK_ID]
+
+outfile <- sprintf("KM_sim%d.RData", TASK_ID)
+
+source("surv_gen.R")
+source("KM_function.R")
+
+RMST_target_time <- c(0.1,0.2,0.5,1,1.5,2,3,4,5,6)
+S_target_time    <- c(0.1,0.2,0.5,1,1.5,2,3,4,5,6)
+
+gen_args <- list(
+  M = 50L, M_range = c(20,200),
+  frail1 = c(2,2), frail0 = c(4.5,4.5),
+  lambda0 = 1, beta = c(0.5,0.5,-1,0.5,-1,1),
+  ctrl_shift = 0.5,
+  mu_W2 = 0, dW2 = 1, mu_Z1 = 0, dZ1 = 1,
+  beta_N = 0.4, beta_AN = -1.5, pow_N = 1,
+  lambda_c = 0.006, c_beta = c(-1,1,2,-2,-1),
+  c_beta_N = -0.5, c_beta_AN = 0, c_pow_N = 1,
+  c_frail1 = c(9.5,9.5), c_frail0 = c(9.5,9.5),
+  admin_tau = 60
+)
+
+my_ids   <- seq_len(MC_total)
+my_seeds <- base_seed * my_ids
+
+Monte_out <- vector("list", length(my_ids))
+names(Monte_out) <- paste0("rep_", my_ids)
+
+for (k in seq_along(my_ids)) {
+  m   <- my_ids[k]
+  dat <- do.call(surv_gen, c(gen_args, list(seed = my_seeds[k])))
+
+  temp_cal <- KM_cal(
+    surv_dt = dat, etime = "Time", censor = "C_ind",
+    trt = "A", strata = "M",
+    RMST_target_time = RMST_target_time,
+    S_target_time = S_target_time
+  )
+
+  Monte_out[[k]] <- temp_cal
+  if (k %% 1L == 0L) {
+    tmp <- paste0(outfile, ".tmp"); save(Monte_out, file = tmp); file.rename(tmp, outfile)
+  }
+}
+save(Monte_out, file = outfile)
+cat(sprintf("KM: done. Saved %s\n", outfile))

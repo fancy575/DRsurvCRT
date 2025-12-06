@@ -1,0 +1,641 @@
+# --- helpers -----------------------------------------------------------------
+#' @useDynLib DRsurvCRT, .registration = TRUE
+#' @importFrom Rcpp sourceCpp
+NULL
+# small helper to extract Surv(time,status) names
+.surv_lhs <- function(formula) {
+  lhs <- as.character(formula)[2]
+  inside <- sub("^Surv\\((.*)\\)$", "\\1", lhs)
+  parts <- strsplit(inside, ",")[[1]]
+  parts <- trimws(parts)
+  if (length(parts) < 2L) stop("formula must be Surv(time, status) ~ ...", call. = FALSE)
+  list(time = parts[1], status = parts[2])
+}
+
+# build censoring formula if NULL (reuse RHS)
+.build_cens_formula <- function(formula, nm) {
+  rhs <- paste(attr(terms(formula), "term.labels"), collapse = "+")
+  as.formula(sprintf("Surv(%s,%s==0) ~ %s", nm$time, nm$status, rhs))
+}
+
+# collect covariate matrices (drop intercepts)
+.model_mats <- function(formula, cens_formula, data) {
+  Xs <- model.matrix(terms(formula), data = data)
+  if (ncol(Xs) && colnames(Xs)[1] == "(Intercept)") Xs <- Xs[, -1, drop = FALSE]
+  Xc <- model.matrix(terms(cens_formula), data = data)
+  if (ncol(Xc) && colnames(Xc)[1] == "(Intercept)") Xc <- Xc[, -1, drop = FALSE]
+  list(Xs = Xs, Xc = Xc)
+}
+
+# --- point estimation core (separate) ----------------------------------------
+
+# Returns full grids (S and RMST) + event_time. No slicing by estimand here.
+.DR_est_core <- function(data, formula, cens_formula, intv, strata,
+                         method = c("marginal","frailty"),
+                         trt_prob = NULL,
+                         fit_controls = NULL) {
+  method <- match.arg(method)
+  nm <- .surv_lhs(formula)
+
+  # order by time, set event grid
+  data <- data[order(data[[nm$time]]), , drop = FALSE]
+  e_time <- sort(unique(data[[nm$time]]))
+
+  # treatment probabilities once
+  if (is.null(trt_prob)) {
+    pr <- .compute_trt_probs(data, trt = intv, strata = strata)
+    p0 <- unname(pr["p0"]); p1 <- unname(pr["p1"])
+  } else {
+    stopifnot(length(trt_prob) == 2L)
+    p0 <- trt_prob[1]; p1 <- trt_prob[2]
+  }
+  .validate_probs(p1, p0)
+
+  # formulas with cluster(strata)
+  rhs_surv <- paste(attr(terms(formula), "term.labels"), collapse = "+")
+  rhs_cens <- paste(attr(terms(cens_formula), "term.labels"), collapse = "+")
+  f_event <- as.formula(sprintf("Surv(%s,%s) ~ %s + cluster(%s)", nm$time, nm$status, rhs_surv, strata))
+  f_cens  <- as.formula(sprintf("Surv(%s,%s==0) ~ %s + cluster(%s)", nm$time, nm$status, rhs_cens, strata))
+
+  # subset fits as in your prototype
+  sub1 <- data[data[[intv]] == 1, , drop = FALSE]
+  if (method == "marginal") {
+    fit_e1 <- survival::coxph(f_event, data = sub1)
+    fit_c1 <- survival::coxph(f_cens,  data = sub1)
+  } else {
+    if (is.null(fit_controls)) {
+      fit_controls <- frailtyEM::emfrail_control(
+        se = FALSE, se_adj = FALSE, ca_test = FALSE, lik_ci = FALSE, zph = FALSE,
+        em_control  = list(eps = 1e-6, maxit = 200, fast_fit = TRUE),
+        nlm_control = list(iterlim = 50)
+      )
+    }
+    fit_e1 <- frailtyEM::emfrail(f_event, data = sub1,
+                                 distribution = frailtyEM::emfrail_dist("gamma", theta = 2),
+                                 control = fit_controls)
+    fit_c1 <- frailtyEM::emfrail(f_cens,  data = sub1,
+                                 distribution = frailtyEM::emfrail_dist("gamma", theta = 2),
+                                 control = fit_controls)
+  }
+  data0 <- data
+  data0[[intv]] <- 1 - data0[[intv]]
+  sub0 <- data0[data0[[intv]] == 1, , drop = FALSE]
+  if (method == "marginal") {
+    fit_e0 <- survival::coxph(f_event, data = sub0)
+    fit_c0 <- survival::coxph(f_cens,  data = sub0)
+  } else {
+    fit_e0 <- frailtyEM::emfrail(f_event, data = sub0,
+                                 distribution = frailtyEM::emfrail_dist("gamma", theta = 2),
+                                 control = fit_controls)
+    fit_c0 <- frailtyEM::emfrail(f_cens,  data = sub0,
+                                 distribution = frailtyEM::emfrail_dist("gamma", theta = 2),
+                                 control = fit_controls)
+  }
+
+  # covariates
+  mm <- .model_mats(formula, cens_formula, data)
+
+  # call C++ backends
+  if (method == "marginal") {
+    raw <- marginal_est(
+      ftime      = data[[nm$time]],
+      delta      = data[[nm$status]],
+      trt        = data[[intv]],
+      strata     = data[[strata]],
+      trt_prob1  = p1,
+      trt_prob0  = p0,
+      censor_cov = mm$Xc,
+      surv_cov   = mm$Xs,
+      censor_fit1= stats::coef(fit_c1), censor_fit0= stats::coef(fit_c0),
+      surv_fit1  = stats::coef(fit_e1), surv_fit0  = stats::coef(fit_e0),
+      e_time     = e_time,
+      RMST_cal   = TRUE
+    )
+  } else {
+    raw <- frailty_est(
+      ftime      = data[[nm$time]],
+      delta      = data[[nm$status]],
+      trt        = data[[intv]],
+      strata     = data[[strata]],
+      trt_prob1  = p1,
+      trt_prob0  = p0,
+      censor_cov = mm$Xc,
+      surv_cov   = mm$Xs,
+      censor_fit1= stats::coef(fit_c1), censor_fit0= stats::coef(fit_c0),
+      beta_c1    = exp(fit_c1$logtheta), beta_c0 = exp(fit_c0$logtheta),
+      surv_fit1  = stats::coef(fit_e1),  surv_fit0  = stats::coef(fit_e0),
+      beta_s1    = exp(fit_e1$logtheta), beta_s0    = exp(fit_e0$logtheta),
+      e_time     = e_time,
+      RMST_cal   = TRUE
+    )
+  }
+
+  et <- as.numeric(raw$event_time)
+  S_cl  <- as.matrix(raw$S_cluster);     rownames(S_cl)  <- et
+  S_ind <- as.matrix(raw$S_individual);  rownames(S_ind) <- et
+  .check_S_warn(S_cl,  "S_cluster")
+  .check_S_warn(S_ind, "S_individual")
+
+  list(
+    trt_prob = c(p0 = p0, p1 = p1),
+    event_time = et,
+    S_cluster_full = S_cl,
+    S_ind_full     = S_ind,
+    RMST_cluster_full = as.matrix(raw$RMST_cluster_out),
+    RMST_ind_full     = as.matrix(raw$RMST_ind_out)
+  )
+}
+
+# --- jackknife variance core (separate) --------------------------------------
+
+# For SPCE: returns variance at the selected time rows (after slicing logic below).
+# For RMST: returns variance at the landmark times.
+.DR_var_jackknife <- function(data, formula, cens_formula, intv, strata,
+                              method = c("marginal","frailty"),
+                              trt_prob = NULL,
+                              # slicing instructions:
+                              estimand = c("SPCE","RMST"),
+                              spce_rows = NULL,      # integer indices on event_time for SPCE
+                              rmst_times = NULL) {   # numeric vector of landmark times for RMST
+  method <- match.arg(method)
+  estimand <- match.arg(estimand)
+
+  nm <- .surv_lhs(formula)
+  data <- data[order(data[[nm$time]]), , drop = FALSE]
+  clusters <- unique(data[[strata]])
+  K <- length(clusters)
+  JKfac <- (K - 1) / K
+
+  # Fix the grid once using full data
+  est0 <- .DR_est_core(data, formula, cens_formula, intv, strata, method, trt_prob)
+  et   <- est0$event_time
+
+  # pre-allocate
+  if (estimand == "SPCE") {
+    if (is.null(spce_rows)) spce_rows <- seq_along(et)
+    nT <- length(spce_rows)
+    agg_cl  <- array(NA_real_, dim = c(nT, 3, K))
+    agg_ind <- array(NA_real_, dim = c(nT, 3, K))
+  } else {
+    if (is.null(rmst_times) || !length(rmst_times))
+      stop("For RMST variance, provide non-empty rmst_times.", call. = FALSE)
+    nL <- length(rmst_times)
+    agg_cl  <- array(NA_real_, dim = c(nL, 3, K))
+    agg_ind <- array(NA_real_, dim = c(nL, 3, K))
+  }
+
+  for (m in seq_along(clusters)) {
+    keep <- data[data[[strata]] != clusters[m], , drop = FALSE]
+    est_m <- .DR_est_core(keep, formula, cens_formula, intv, strata, method, trt_prob)
+
+    if (estimand == "SPCE") {
+      Scl <- est_m$S_cluster_full[spce_rows, , drop = FALSE]
+      Sind<- est_m$S_ind_full[spce_rows,    , drop = FALSE]
+      agg_cl[, , m]  <- Scl
+      agg_ind[, , m] <- Sind
+    } else {
+      # linear patch at landmarks, as in your RMST slicing
+      idx <- pmax(1L, findInterval(rmst_times, est_m$event_time))
+      tdiff <- rmst_times - est_m$event_time[idx]
+      Rcl <- est_m$RMST_cluster_full[idx, , drop = FALSE] +
+        sweep(est_m$S_cluster_full[idx, , drop = FALSE], 1L, tdiff, `*`)
+      Rind<- est_m$RMST_ind_full[idx, , drop = FALSE] +
+        sweep(est_m$S_ind_full[idx,    , drop = FALSE], 1L, tdiff, `*`)
+      agg_cl[, , m]  <- Rcl
+      agg_ind[, , m] <- Rind
+    }
+  }
+
+  # jackknife variance + covariance
+  mean_cl  <- apply(agg_cl,  c(1,2), mean, na.rm = TRUE)
+  mean_ind <- apply(agg_ind, c(1,2), mean, na.rm = TRUE)
+  r_cl  <- sweep(agg_cl,  c(1,2), mean_cl,  "-")
+  r_ind <- sweep(agg_ind, c(1,2), mean_ind, "-")
+  var_cl  <- JKfac * apply(r_cl^2,  c(1,2), sum, na.rm = TRUE)
+  var_ind <- JKfac * apply(r_ind^2, c(1,2), sum, na.rm = TRUE)
+  cov_cl  <- JKfac * apply(r_cl[,1,] * r_cl[,2,], 1, sum, na.rm = TRUE)
+  cov_ind <- JKfac * apply(r_ind[,1,] * r_ind[,2,], 1, sum, na.rm = TRUE)
+
+  list(
+    Cluster   = cbind(var_cl, cov = cov_cl),
+    Individual= cbind(var_ind, cov = cov_ind),
+    event_time = et # for reference
+  )
+}
+
+# --- user-facing assembler ---------------------------------------------------
+
+#' Doubly-robust survival estimation for CRTs (SPCE or RMST)
+#'
+#' @title DRsurvfit
+#'
+#' @description
+#' Fits doubly-robust estimators for survival outcomes in Cluster-Randomized Trials (CRTs),
+#' targeting either survival probability contrasts (SPCE) over time or restricted mean
+#' survival time (RMST) at user-specified landmark times. The nuisance models can be
+#' fit using either a marginal Cox model or a gamma-frailty Cox model, and jackknife
+#' (leave-one-cluster-out) variance is available.
+#'
+#' @details
+#' **Design and estimands.** Clusters (identified by `strata`) receive binary treatment
+#' `intv`. Estimation targets treatment contrasts at the cluster level and the individual
+#' level. Two estimand families are supported:
+#'
+#' - **SPCE** (Survival Probability Contrast over time): returns \eqn{(S_1, S_0, S_1 - S_0)}
+#'   on a time grid up to `cutoff`. If `cutoff = NULL`, the full event-time grid is used.
+#' - **RMST** (Restricted Mean Survival Time): returns \eqn{(R_1, R_0, R_1 - R_0)} at
+#'   landmark times given in `cutoff` (a numeric vector; must be supplied for RMST).
+#'
+#' **Censoring and outcome models.** Nuisance fits (censoring and survival) are estimated
+#' on the treated subset and on a "flipped" dataset as in the prototype:
+#' 1) subset to `intv == 1` and fit models (producing \eqn{\hat\psi_1});
+#' 2) replace `intv` by `1 - intv`, subset to 1, and refit (producing \eqn{\hat\psi_0}).
+#'
+#' Doubly-robust consistency holds if either the censoring model or the outcome model
+#' is correctly specified under covariate-dependent censoring.
+#'
+#' **Jackknife variance.** If `variance = "jackknife"`, variances are computed via
+#' leave-one-cluster-out jackknife on the sliced outputs (SPCE at the effective grid; RMST at landmarks).
+#'
+#' **Validity checks.** The function warns (does not stop) if ≥ 50% of survival values
+#' are zeros in key columns, which may signal unstable RMST/SPCE downstream.
+#'
+#' @param data A data.frame containing all variables used by the formulas and `intv`, `strata`.
+#' @param formula A survival formula of the form `Surv(time, event) ~ covariates`
+#'   used for the **outcome** model.
+#' @param cens_formula Optional survival formula for the **censoring** model.
+#'   If `NULL`, the RHS of `formula` is reused and the LHS becomes `Surv(time, event == 0)`.
+#' @param intv Character scalar; the column name of the cluster-level treatment (0/1).
+#'   Must be constant within each cluster.
+#' @param strata Character scalar; the column name identifying clusters.
+#' @param method One of `"marginal"` (Cox PH via \pkg{survival}) or `"frailty"`
+#'   (gamma-frailty Cox via \pkg{frailtyEM}).
+#' @param estimand One of `"SPCE"` or `"RMST"`.
+#' @param cutoff For `estimand = "SPCE"`, either `NULL` (use the full time grid)
+#'   or a single numeric value giving the **maximum time** to include.
+#'   For `estimand = "RMST"`, a numeric vector of **landmark times** at which to compute RMST (required).
+#' @param trt_prob Optional numeric vector of length 2 giving `(p0, p1)`, the probabilities
+#'   for control and treatment at the cluster level. If `NULL`, computed from first row per cluster.
+#' @param variance One of `"none"` or `"jackknife"` (leave-one-cluster-out).
+#' @param fit_controls Optional control list passed to \code{frailtyEM::emfrail_control()}
+#'   when `method = "frailty"`. If `NULL`, a fast default is used.
+#' @param verbose Logical; print progress messages (currently reserved).
+#'
+#' @return An object of class `DRsurvfit` with elements:
+#' \describe{
+#'   \item{method, estimand, cutoff}{Echo of inputs.}
+#'   \item{trt_prob}{Vector `(p0, p1)` used in estimation.}
+#'   \item{event_time}{Full event-time grid used internally.}
+#'   \item{event_time_eff}{For SPCE only, the **effective** grid after applying the max-time cutoff.}
+#'   \item{S_full_cluster, S_full_ind}{Full survival grids (rows = event times; cols = `S1`, `S0`, `S1-S0`).}
+#'   \item{S_cluster, S_individual}{SPCE outputs sliced to the effective grid (NULL for RMST).}
+#'   \item{RMST_cluster, RMST_ind}{RMST at landmark times (NULL for SPCE).}
+#'   \item{var_cluster, var_ind}{If `variance="jackknife"`, matrices with columns
+#'     `c("S1","S0","S1-S0","cov")` for SPCE or `c("R1","R0","R1-R0","cov")` for RMST.}
+#' }
+#'
+#' @section Interpretation:
+#' Columns are ordered as treatment, control, and the contrast (difference).
+#' For SPCE, rownames are event times (possibly truncated by `cutoff`);
+#' for RMST, rownames are the requested landmark times.
+#'
+#' @seealso [summary.DRsurvfit()], [plot.DRsurvfit()]
+#'
+#' @examples
+#' # Example assumes a dataset `dat` shipped with the package:
+#' data(dat)
+#'
+#' # SPCE (survival probabilities) on the full grid, marginal Cox
+#' fit_spce <- DRsurvfit(
+#'   data = dat,
+#'   formula = survival::Surv(time, event) ~ W1 + W2 + Z1 + Z2,
+#'   cens_formula = NULL,          # reuse RHS; censoring is Surv(time, event==0)
+#'   intv = "A", strata = "M",
+#'   method = "marginal",
+#'   estimand = "SPCE",
+#'   cutoff = NULL,                # full grid
+#'   variance = "none"
+#' )
+#' summary(fit_spce)
+#' plot(fit_spce, level = "cluster")
+#'
+#' # RMST at landmarks (0.5, 1, 2), gamma-frailty Cox + jackknife variance
+#' \donttest{
+#' fit_rmst <- DRsurvfit(
+#'   data = dat,
+#'   formula = survival::Surv(time, event) ~ W1 + W2 + Z1 + Z2,
+#'   intv = "A", strata = "M",
+#'   method = "frailty",
+#'   estimand = "RMST",
+#'   cutoff = c(0.5, 1, 2),
+#'   variance = "jackknife"
+#' )
+#' summary(fit_rmst)
+#' }
+#'
+#' @export
+DRsurvfit <- function(data,
+                      formula,
+                      cens_formula = NULL,
+                      intv,
+                      strata,
+                      method = c("marginal", "frailty"),
+                      estimand = c("SPCE", "RMST"),
+                      cutoff = NULL,
+                      trt_prob = NULL,
+                      variance = c("none","jackknife"),
+                      fit_controls = NULL,
+                      verbose = FALSE) {
+
+  ## ---- arg matching ----
+  method   <- match.arg(method)
+  estimand <- match.arg(estimand)
+  variance <- match.arg(variance)
+
+  ## ---- basic data checks ----
+  if (!is.data.frame(data))
+    stop("'data' must be a data.frame.", call. = FALSE)
+
+  nm <- .surv_lhs(formula)
+  if (!all(c(nm$time, nm$status) %in% names(data)))
+    stop(sprintf("Variables in Surv() not found in 'data': %s, %s.",
+                 nm$time, nm$status), call. = FALSE)
+
+  if (!all(c(intv, strata) %in% names(data)))
+    stop(sprintf("Columns '%s' and/or '%s' not found in 'data'.", intv, strata),
+         call. = FALSE)
+
+  ## time & status sanity
+  if (!is.numeric(data[[nm$time]]) || any(!is.finite(data[[nm$time]])))
+    stop(sprintf("'%s' must be numeric and finite.", nm$time), call. = FALSE)
+
+  st <- data[[nm$status]]
+  if (!is.numeric(st) && !is.integer(st) && !is.logical(st))
+    stop(sprintf("'%s' must be binary (0/1 or logical).", nm$status), call. = FALSE)
+  st_num <- as.numeric(st)
+  bad_st <- !(st_num %in% c(0,1))
+  if (any(bad_st, na.rm = TRUE))
+    stop(sprintf("'%s' contains values other than 0/1.", nm$status), call. = FALSE)
+
+  ## ---- treatment sanity (cluster-level) ----
+  if (!all(is.finite(data[[intv]])))
+    stop(sprintf("'%s' contains missing/inf values.", intv), call. = FALSE)
+
+  # constant within clusters
+  by_cl <- tapply(data[[intv]], data[[strata]], function(z) length(unique(z)))
+  if (any(by_cl != 1L))
+    stop(sprintf("'%s' must be constant within each '%s' (cluster-level treatment).",
+                 intv, strata), call. = FALSE)
+
+  # binary at cluster level
+  cl_first <- tapply(data[[intv]], data[[strata]], function(z) z[1])
+  uniq_trt <- sort(unique(cl_first))
+  if (!all(uniq_trt %in% c(0,1)) || length(uniq_trt) != 2L)
+    stop(sprintf("'%s' must be binary at the cluster level with both 0 and 1 present.",
+                 intv), call. = FALSE)
+
+  ## ---- censoring formula default + variable presence ----
+  if (is.null(cens_formula)) cens_formula <- .build_cens_formula(formula, nm)
+
+  # ensure all RHS variables of both formulas exist
+  rhs_vars <- function(f) {
+    tl <- attr(terms(f), "term.labels")
+    if (is.null(tl)) character(0) else tl
+  }
+  needed <- unique(c(rhs_vars(formula), rhs_vars(cens_formula), intv, strata, nm$time, nm$status))
+  missing_cols <- setdiff(needed, names(data))
+  if (length(missing_cols))
+    stop("Missing variables in 'data': ", paste(missing_cols, collapse = ", "),
+         call. = FALSE)
+
+  ## ---- NA checks on used variables ----
+  used_df <- data[, unique(c(rhs_vars(formula), rhs_vars(cens_formula),
+                             nm$time, nm$status, intv, strata)), drop = FALSE]
+  if (anyNA(used_df)) {
+    na_cols <- names(which(colSums(!is.finite(as.data.frame(lapply(used_df, as.numeric)))) > 0))
+    if (length(na_cols) == 0L) na_cols <- names(which(colSums(is.na(used_df)) > 0))
+    stop("NA/Non-finite values detected in variables used by the model: ",
+         paste(unique(na_cols), collapse = ", "),
+         call. = FALSE)
+  }
+
+  ## ---- trt probabilities (if supplied) ----
+  if (!is.null(trt_prob)) {
+    if (!(is.numeric(trt_prob) && length(trt_prob) == 2L && all(is.finite(trt_prob))))
+      stop("'trt_prob' must be numeric length-2 (p0, p1).", call. = FALSE)
+    .validate_probs(trt_prob[2], trt_prob[1])  # (p1, p0)
+  }
+
+  ## ---- cutoff rules ----
+  if (estimand == "SPCE") {
+    if (!is.null(cutoff)) {
+      if (!(is.numeric(cutoff) && length(cutoff) == 1L && is.finite(cutoff)))
+        stop("For SPCE, 'cutoff' must be a single finite numeric (max time) or NULL.", call. = FALSE)
+      if (cutoff < 0) warning("SPCE 'cutoff' is < 0; using times <= cutoff will yield an empty set.", call. = FALSE)
+    }
+  } else { # RMST
+    if (is.null(cutoff) || !is.numeric(cutoff) || !length(cutoff) || any(!is.finite(cutoff)) )
+      stop("For RMST, 'cutoff' must be a non-empty numeric vector of finite landmark times.", call. = FALSE)
+    if (any(cutoff < 0))
+      warning("Some RMST landmarks are < 0; they will map to the first event time.", call. = FALSE)
+  }
+
+  ## ---- jackknife feasibility ----
+  if (variance == "jackknife") {
+    K <- length(unique(data[[strata]]))
+    if (K < 2L)
+      stop("Jackknife variance requires at least 2 clusters.", call. = FALSE)
+  }
+
+  ## ---- 1) point estimates (full grids) ----
+  est <- .DR_est_core(data, formula, cens_formula, intv, strata, method, trt_prob, fit_controls)
+  et  <- est$event_time
+
+  ## ---- 2) slice by estimand ----
+  S_cl  <- est$S_cluster_full
+  S_ind <- est$S_ind_full
+
+  if (estimand == "SPCE") {
+    # cutoff = max time; if NULL, keep entire grid
+    if (!is.null(cutoff)) {
+      keep <- which(et <= cutoff)
+      if (!length(keep))
+        stop("SPCE 'cutoff' is earlier than the first event time; no rows to keep.", call. = FALSE)
+      S_cl  <- S_cl[keep, , drop = FALSE]
+      S_ind <- S_ind[keep, , drop = FALSE]
+      et_eff <- et[keep]
+    } else {
+      et_eff <- et
+    }
+
+    # variance (optional)
+    var_out <- if (variance == "jackknife") {
+      .DR_var_jackknife(data, formula, cens_formula, intv, strata,
+                        method, trt_prob,
+                        estimand = "SPCE",
+                        spce_rows = match(et_eff, est$event_time))
+    } else NULL
+
+    out <- list(
+      method      = method,
+      estimand    = estimand,
+      cutoff      = cutoff,       # max time if provided
+      event_time  = et,           # full grid
+      event_time_eff = et_eff,    # effective grid used for SPCE outputs
+      S_full_cluster = est$S_cluster_full,
+      S_full_ind     = est$S_ind_full,
+      S_cluster   = S_cl,
+      S_individual= S_ind,
+      RMST_cluster= NULL,
+      RMST_ind    = NULL,
+      trt_prob    = unname(est$trt_prob),
+      var_cluster = if (!is.null(var_out)) var_out$Cluster else NULL,
+      var_ind     = if (!is.null(var_out)) var_out$Individual else NULL
+    )
+
+  } else { # RMST
+    idx <- pmax(1L, findInterval(cutoff, et))
+    tdiff <- cutoff - et[idx]
+    R_cl <- est$RMST_cluster_full[idx, , drop = FALSE] +
+      sweep(S_cl[idx, , drop = FALSE],  1L, tdiff, `*`)
+    R_ind<- est$RMST_ind_full[idx,    , drop = FALSE] +
+      sweep(S_ind[idx, , drop = FALSE], 1L, tdiff, `*`)
+    rownames(R_cl) <- rownames(R_ind) <- cutoff
+
+    var_out <- if (variance == "jackknife") {
+      .DR_var_jackknife(data, formula, cens_formula, intv, strata,
+                        method, trt_prob,
+                        estimand = "RMST",
+                        rmst_times = cutoff)
+    } else NULL
+
+    out <- list(
+      method      = method,
+      estimand    = estimand,
+      cutoff      = cutoff,         # landmark times
+      event_time  = et,             # full grid (useful for plotting S)
+      event_time_eff = NULL,
+      S_full_cluster = est$S_cluster_full,
+      S_full_ind     = est$S_ind_full,
+      S_cluster   = NULL,
+      S_individual= NULL,
+      RMST_cluster= R_cl,
+      RMST_ind    = R_ind,
+      trt_prob    = unname(est$trt_prob),
+      var_cluster = if (!is.null(var_out)) var_out$Cluster else NULL,
+      var_ind     = if (!is.null(var_out)) var_out$Individual else NULL
+    )
+  }
+
+  class(out) <- "DRsurvfit"
+  out
+}
+
+
+# --- methods -----------------------------------------------------------------
+
+#' Summarize a DRsurvfit object
+#'
+#' @description
+#' Prints concise summaries of the estimated treatment effects.
+#' For SPCE, survival probability contrasts are displayed at four representative
+#' timepoints (~10%, 25%, 50%, 75% of the effective time grid).
+#' For RMST, the table is shown at the user-specified landmark times.
+#'
+#' @param object An object of class `DRsurvfit` (returned by [DRsurvfit()]).
+#' @param digits Number of digits to print.
+#' @param ... Unused; for S3 compatibility.
+#'
+#' @details
+#' If jackknife variance was requested, you can extract it from
+#' `object$var_cluster` and `object$var_ind` to compute standard errors
+#' or intervals externally.
+#'
+#' @return The input `object` (invisibly).
+#'
+#' @examples
+#' data(dat)
+#' fit <- DRsurvfit(
+#'   dat, survival::Surv(time, event) ~ W1 + W2 + Z1 + Z2,
+#'   intv = "A", strata = "M", method = "marginal", estimand = "SPCE"
+#' )
+#' summary(fit, digits = 3)
+#'
+#' @seealso [DRsurvfit()], [plot.DRsurvfit()]
+#' @export
+#'
+summary.DRsurvfit <- function(object, digits = 4, ...) {
+  cat(sprintf("DRsurvfit: method = %s, estimand = %s\n", object$method, object$estimand))
+  if (!is.null(object$cutoff)) {
+    cat("cutoff:", paste(signif(object$cutoff, digits), collapse = ", "), "\n")
+  }
+  cat("Treatment probs (p0, p1):", paste(signif(object$trt_prob, digits), collapse = ", "), "\n\n")
+
+  if (object$estimand == "SPCE") {
+    # choose 10%, 25%, 50%, 75% timepoints from effective grid (or full if NULL)
+    et_eff <- if (!is.null(object$event_time_eff)) object$event_time_eff else object$event_time
+    if (!is.null(object$S_cluster)) {
+      qs <- stats::quantile(et_eff, probs = c(0.10, 0.25, 0.50, 0.75), type = 1)
+      pick <- pmax(1L, findInterval(as.numeric(qs), et_eff))
+      cat("Cluster-level SPCE at ~10%,25%,50%,75% of time grid:\n")
+      print(round(object$S_cluster[pick, , drop = FALSE], digits))
+    }
+    if (!is.null(object$S_individual)) {
+      qs <- stats::quantile(et_eff, probs = c(0.10, 0.25, 0.50, 0.75), type = 1)
+      pick <- pmax(1L, findInterval(as.numeric(qs), et_eff))
+      cat("\nIndividual-level SPCE at ~10%,25%,50%,75% of time grid:\n")
+      print(round(object$S_individual[pick, , drop = FALSE], digits))
+    }
+  } else {
+    cat("Cluster-level RMST at landmarks:\n")
+    print(round(object$RMST_cluster, digits))
+    cat("\nIndividual-level RMST at landmarks:\n")
+    print(round(object$RMST_ind, digits))
+  }
+  invisible(object)
+}
+
+#' Plot survival curves from a DRsurvfit object
+#'
+#' @description
+#' Plots the two survival curves (treatment `S1` and control `S0`) for either the
+#' cluster-level or individual-level estimand. This is a visual for SPCE-type
+#' outputs; it ignores RMST tables (which are point summaries).
+#'
+#' @param x An object of class `DRsurvfit`.
+#' @param level Either `"cluster"` or `"individual"` to choose which survival
+#'   curves to plot.
+#' @param ... Unused; for S3 compatibility.
+#'
+#' @details
+#' The plot always uses the **full** survival grids (`x$S_full_cluster` or
+#' `x$S_full_ind`) against `x$event_time`. The solid line is `S1` (treatment),
+#' the dashed line is `S0` (control).
+#'
+#' @return The input object `x` (invisibly).
+#'
+#' @examples
+#' data(dat)
+#' fit <- DRsurvfit(
+#'   dat, survival::Surv(time, event) ~ W1 + W2 + Z1 + Z2,
+#'   intv = "A", strata = "M", method = "marginal", estimand = "SPCE"
+#' )
+#' plot(fit, level = "individual")
+#'
+#' @seealso [DRsurvfit()], [summary.DRsurvfit()]
+#' @export
+plot.DRsurvfit <- function(x, level = c("cluster", "individual"), ...) {
+  level <- match.arg(level)
+  mat <- if (level == "cluster") x$S_full_cluster else x$S_full_ind
+  if (is.null(mat)) {
+    warning("No survival curves available to plot.", call. = FALSE)
+    return(invisible(x))
+  }
+  yy1 <- mat[, 1L]  # S1
+  yy0 <- mat[, 2L]  # S0
+  plot(x$event_time, yy1, type = "l", xlab = "time", ylab = "Survival",
+       main = sprintf("%s-level survival curves (%s)", level, x$method))
+  lines(x$event_time, yy0, lty = 2)
+  legend("topright", legend = c("Treatment (S1)","Control (S0)"), lty = c(1,2), bty = "n")
+  invisible(x)
+}

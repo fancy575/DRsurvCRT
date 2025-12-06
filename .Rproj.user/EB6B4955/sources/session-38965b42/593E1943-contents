@@ -1,0 +1,31 @@
+library(DRsurvCRT)
+data(datm)
+
+## Marginal working model, multi-state RMT-IF
+fit_rmtif <- DRsurvfit(
+  data     = datm,
+  formula  = Surv(time, event) ~ W1 + W2 + Z1 + Z2 + cluster(cluster),
+  intv     = "trt",
+  method   = "marginal",
+  estimand = "RMTIF",
+  variance = "jackknife"
+)
+
+## Summary: stage-wise and summed RMT-IF at chosen tau
+summary(
+  fit_rmtif,
+  estimand = "RMTIF",
+  level    = "cluster",         # or "individual"
+  tau      = c(2, 5, 10),       # truncation times
+  alpha    = 0.05,
+  digits   = 3
+)
+
+## Plot: RMT-IF diff (sum over all states) with t-based CI
+plot(
+  fit_rmtif,
+  estimand = "RMTIF",
+  level    = "cluster",
+  tau      = 10,              # full time grid; use tau = 10, say, to truncate
+  alpha    = 0.05
+)

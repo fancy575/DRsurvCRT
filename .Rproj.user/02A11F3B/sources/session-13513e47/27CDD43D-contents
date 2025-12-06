@@ -1,0 +1,137 @@
+source("DR_win_est.R")
+var_S <- function(jack_out,M) {
+  m <- length(jack_out)  # Number of elements in the list
+  t <- length(jack_out[[1]][[1]])  # Number of tau values
+  max_s <- ncol(jack_out[[1]][[1]][[1]])  # Number of columns (max_s)
+  
+  # Initialize results
+  S1_variance <- array(0, dim = c(t, max_s))  # Variance for S1
+  S0_variance <- array(0, dim = c(t, max_s))  # Variance for S0
+  
+  for (tau_idx in 1:t) {
+    for (col in 1:max_s) {
+      # Collect all S1 and S0 values for the current tau and column
+      S1_values <- sapply(jack_out, function(cluster) cluster[[1]][[tau_idx]][1, col])
+      S0_values <- sapply(jack_out, function(cluster) cluster[[1]][[tau_idx]][2, col])
+      
+      # Calculate means
+      mean_S1 <- mean(S1_values)
+      mean_S0 <- mean(S0_values)
+      
+      # Calculate variances
+      S1_variance[tau_idx, col] <- sum((S1_values - mean_S1)^2) * (M - 1)/M 
+      S0_variance[tau_idx, col] <- sum((S0_values - mean_S0)^2) * (M - 1)/M 
+    }
+  }
+  
+  # Return results as a list
+  list(S1_variance = S1_variance, S0_variance = S0_variance)
+}
+
+var_stage_wise <- function(jack_out,M) {
+  m <- length(jack_out)  # Number of elements in the list
+  t <- length(jack_out[[1]]$stage_wise)  # Number of tau values
+  max_s <- dim(jack_out[[1]]$stage_wise[[1]])[2]  # max_s = columns + 1
+  
+  # Initialize results
+  stage_wise_variance <- vector("list", t)  # Variance for each tau
+  
+  for (tau_idx in 1:t) {
+    # Initialize variance matrix for this tau (3 rows: row1, row2, row1 - row2)
+    tau_variance <- matrix(0, nrow = 3, ncol = max_s)
+    
+    for (col in 1:max_s) {
+      # Extract row1 and row2 values for this column across clusters
+      row1_values <- sapply(jack_out, function(cluster) cluster$stage_wise[[tau_idx]][1, col])
+      row2_values <- sapply(jack_out, function(cluster) cluster$stage_wise[[tau_idx]][2, col])
+      row3_values <- sapply(jack_out, function(cluster) cluster$stage_wise[[tau_idx]][3, col])
+      # Calculate means for row1 and row2
+      mean_row1 <- mean(row1_values)
+      mean_row2 <- mean(row2_values)
+      mean_row3 <- mean(row3_values)
+      
+      # Calculate variances for row1, row2 row3
+      tau_variance[1, col] <- sum((row1_values - mean_row1)^2) * (M - 1)/M 
+      tau_variance[2, col] <- sum((row2_values - mean_row2)^2) * (M - 1)/M 
+      tau_variance[3, col] <- sum((row3_values - mean_row3)^2) * (M - 1)/M 
+    }
+    
+    # Store variance matrix for this tau
+    stage_wise_variance[[tau_idx]] <- tau_variance
+  }
+  # Return results as a list
+  names(stage_wise_variance) <- paste0("tau_", 1:t)  # Name each list item by tau
+  return(stage_wise_variance)
+  
+  
+  
+}
+
+
+DR_win_var <- function(surv_dt, etime="obs_T",status = "Delta",
+                        id = "id",
+                        trt = "A",
+                        censor_cov=c("W1","W2","Z1","Z2"), ## covariates for censoring probability
+                        surv_cov=c("W1","W2","Z1","Z2"), ## covariates for probability in augmentation
+                        strata="M", prop1=0.5, prop0=0.5,
+                        tau = c(0.5,1,1.5,2)
+                   ){
+  
+
+  max_s <- max(surv_dt[,status]) ## number of status
+  
+  
+  M <- unique(surv_dt[,strata] )
+
+  jack_out_cluster_S <- list()
+  jack_out_ind_S <-  list()
+
+
+  
+  for(m in 1:length(M)){
+    feed_dt <- surv_dt[which(surv_dt[,strata] != M[m] ),]
+    jack_fit <- DR_win_est(feed_dt,etime,status,id,trt,censor_cov, surv_cov,
+                           strata, prop1, prop0,
+                           tau)
+    jack_out_cluster_S[[m]] <- jack_fit$Sc_out
+    jack_out_ind_S[[m]] <- jack_fit$Si_out
+  }
+  
+  ## Summarize into variance
+  ## cluster
+  cluster_S <- var_S(jack_out_cluster_S,length(M))
+  cluster_stage <- var_stage_wise(jack_out_cluster_S,length(M))
+
+  
+  ## individual
+  
+  individual_S <- var_S(jack_out_ind_S,length(M))
+  individual_stage <- var_stage_wise(jack_out_ind_S,length(M))
+  
+  colnames(individual_S$S1_variance) <- colnames(individual_S$S0_variance)  <- 
+    colnames(cluster_S$S1_variance)  <- colnames(cluster_S$S0_variance)  <- 
+    paste("stage",1:max_s,sep="_")
+  
+  rownames(individual_S$S1_variance) <- rownames(individual_S$S0_variance)  <- 
+    rownames(cluster_S$S1_variance)  <- rownames(cluster_S$S0_variance)  <- 
+    paste("tau",tau,sep="=")
+  
+  names(individual_stage) <- names(cluster_stage) <- paste("tau",tau,sep="=")
+  
+
+  individual_stage <- lapply(individual_stage, function(matrix_element) {
+                      rownames(matrix_element) <- c("s1qs0qp1","s0qs1qp1","diff")
+                      colnames(matrix_element) <- c(paste("stage",1:(max_s),sep="_"),"sum")
+                      return(matrix_element)
+                      })
+  
+  cluster_stage <- lapply(cluster_stage, function(matrix_element) {
+                        rownames(matrix_element) <- c("s1qs0qp1","s0qs1qp1","diff")
+                        colnames(matrix_element) <- c(paste("stage",1:(max_s),sep="_"),"sum")
+                        return(matrix_element)
+                        })
+  return(list(cluster_S,cluster_stage,individual_S,individual_stage))
+  
+  
+  
+}

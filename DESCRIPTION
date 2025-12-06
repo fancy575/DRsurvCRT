@@ -1,0 +1,28 @@
+Package: DRsurvCRT
+Type: Package
+Title: Doubly-Robust Survival Estimation for Cluster-Randomized Trials
+Version: 0.0.1
+Authors@R: c(
+    person(given = "Xi", family = "Fang", role = c("aut")),
+    person(given = "Bingkai", family = "Wang", role = c("aut")),
+    person(given = "Liangyuan", family = "Hu", role = c("aut")),
+    person(given = "Fan", family = "Li", role = c("aut","cre"), email = "fan.li@example.edu")
+  )
+Description: Cluster-randomized trials (CRTs) randomize groups (clusters) rather than
+    individuals. Valid CRT analysis requires distinguishing cluster-level and individual-level
+    treatment effects and defining estimands under potential outcomes. For right-censored
+    survival outcomes, treatment effects are commonly summarized by contrasts of survival
+    functions (SPCE) or restricted mean survival times (RMST). This package formalizes
+    cluster- and individual-level estimands for CRTs with survival endpoints and implements
+    doubly robust (DR) estimators under covariate-dependent censoring. The DR estimators are
+    consistent if either the censoring model or the outcome model is correctly specified.
+    Users may choose marginal Cox or gamma-frailty working models for the nuisance fits.
+    Jackknife (leave-one-cluster-out) variance and interval estimation is provided.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+LinkingTo: Rcpp, RcppArmadillo
+Imports: survival, stats, Rcpp, frailtyEM, ggplot2, dplyr
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+Depends: R (>= 2.10)

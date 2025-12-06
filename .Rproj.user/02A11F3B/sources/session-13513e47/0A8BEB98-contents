@@ -1,0 +1,126 @@
+#!/usr/bin/env Rscript
+
+## ---- SLURM / array config ----
+TASK_ID  <- as.integer(Sys.getenv("SLURM_ARRAY_TASK_ID", "1"))
+NWORKERS <- as.integer(Sys.getenv("NWORKERS", "10"))
+MC_total <- as.integer(Sys.getenv("MC_TOTAL", "1500"))
+
+## seed bases for each worker (ensure length >= NWORKERS)
+seed_bases <- c(123, 234, 345, 456, 567, 678, 789, 890, 901,1002, 2123,2425,3678)
+if (length(seed_bases) < NWORKERS) stop("not enough seed bases")
+base_seed <- seed_bases[TASK_ID]
+
+## output file per worker (matches template naming)
+outfile <- sprintf("B_corr_sim%d.RData", TASK_ID)
+
+## ---- deps & sources ----
+suppressMessages({
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package 'dplyr' is required")
+  library(dplyr)
+})
+
+source("Data_generation.R")
+source("DR_sw_win_cal.R")
+
+## ---- analysis settings ----
+tau <- c(0.5, 1, 1.5, 2,2.5,3,3.5)
+
+## Split MC reps across workers
+all_ids <- seq_len(MC_total)
+cuts    <- cut(all_ids, breaks = NWORKERS, labels = FALSE)
+my_ids  <- all_ids[cuts == TASK_ID]
+
+## per-rep seeds (deterministic, distinct across workers)
+my_seeds <- base_seed * my_ids
+
+Monte_out <- vector("list", length(my_ids))
+names(Monte_out) <- paste0("rep_", my_ids)
+
+checkpoint_every <- 1L
+
+## ---- main loop ----
+for (k in seq_along(my_ids)) {
+  m <- my_ids[k]
+
+  ## data generation (use our worker-specific per-rep seed)
+  gen_data <- tryCatch(
+    gen_surv(
+      M = 60,                       # number of clusters
+      M_parm = c(10, 90),           # cluster size from uniform(20,200) -> using 10..90 per your code
+      frailty_trt = c(2, 2),        # frailty parameter for treatment 
+      frailty_ctrl = c(4.5, 4.5),   # frailty parameter for control
+      frailty_censor = c(9.5, 9.5), # frailty for censoring
+      lambda0_trt = 0.01,            # baseline hazard for treatment
+      lambda0_ctrl = 0.005,          # baseline hazard for control
+      lambda0_trt_gap = 2,        # baseline hazard for trt for gap
+      lambda0_ctrl_gap = 1,       # baseline hazard for control for gap
+      lambda0_trt_end = 0.08,       # baseline hazard for trt for fatal
+      lambda0_ctrl_end = 0.04,      # baseline hazard for control for fatal
+      parm_cov_strate1 = c(1, 2, 1, -0.6, 1), # covariate effect for state1
+      parm_state1_trt = -1,       # treatment effect for state1
+      parm_cov_gap = c(-1, 1, -2, 1, 1),     # covariate effect for gap
+      parm_gap_trt = -0.5,          # treatment effect for gap
+      parm_cov_end = c(-1, 1, 2, -1, -1),  # covariate effect for fatal
+      parm_end_trt = -2,            # treatment effect for fatal
+      N_cov_parm = 1,             # effect for cluster size
+      lambdac = 0.13,            # baseline hazard for censoring 
+      censor_parm = c(1,0.5, -0.5, -0.8, 0.5),  # covariate effect for censoring
+      cut = Inf,
+      seed = my_seeds[k]
+    ),
+    error = function(e) {
+      cat(sprintf("TASK %d: m=%d data gen error: %s\n", TASK_ID, m, conditionMessage(e)))
+      NULL
+    }
+  )
+
+  if (is.null(gen_data)) {
+    Monte_out[[k]] <- NULL
+    next
+  }
+
+  ## compute Ni as in your example
+  sum_N <- gen_data %>%
+    group_by(M) %>%
+    summarise(n = dplyr::n(), .groups = "drop")
+  gen_data <- gen_data %>%
+    group_by(M) %>%
+    mutate(Ni = sum_N$n[match(M, sum_N$M)] / 50) %>%
+    ungroup()
+  
+  gen_data <- as.data.frame(gen_data)
+
+  ## run estimator
+  temp_cal <- tryCatch(
+    DR_sw_win_cal(
+      gen_data,
+      etime  = "obs_T",
+      status = "Delta",
+      id     = "id",
+      trt    = "A",
+      censor_cov = c("W1","W2","Z1","Z2"),  # covariates for censoring probability
+      surv_cov   = c("W1","W2","Z1","Z2","Z1Ni","Ni"),  # covariates for augmentation
+      strata = "M",
+      tau = tau
+    ),
+    error = function(e) {
+      cat(sprintf("TASK %d: m=%d DR_sw_win_cal error: %s\n", TASK_ID, m, conditionMessage(e)))
+      NULL
+    }
+  )
+
+  Monte_out[[k]] <- temp_cal
+  cat(sprintf("TASK %d: finished rep %d/%d (global m=%d)\n",
+              TASK_ID, k, length(my_ids), m))
+
+  ## checkpoint
+  if (k %% checkpoint_every == 0L) {
+    tmp <- paste0(outfile, ".tmp")
+    save(Monte_out, file = tmp)
+    file.rename(tmp, outfile)
+  }
+}
+
+## final save
+save(Monte_out, file = outfile)
+cat(sprintf("TASK %d: done. Saved %s\n", TASK_ID, outfile))

@@ -1,0 +1,45 @@
+# Find the threshold τ that makes prop.table(table(C_ind))["0"] ≈ target
+# (exact if there are no ties at the boundary under the >= rule)
+set_admin_cutoff <- function(dat, target = 0.5) {
+  Time <- dat$Time
+  Delta <- dat$C_ind  # 1=event, 0=censored
+  
+  N   <- length(Time)
+  n0  <- sum(Delta == 0L)         # already censored
+  n1  <- sum(Delta == 1L)         # events
+  need <- ceiling(target * N - n0)  # extra events to censor administratively
+  
+  if (need <= 0) {
+    return(list(tau = Inf, achieved = n0 / N, dat = dat, note = "Already at/above target"))
+  }
+  if (need > n1) {
+    stop(sprintf("Target %.3f unreachable: only %d events available to flip.", target, n1))
+  }
+  
+  evt <- Time[Delta == 1L]
+  # work with unique descending event times and cumulative counts
+  u <- sort(unique(evt), decreasing = TRUE)
+  cnt <- tabulate(factor(evt, levels = u))    # count of events at each unique time
+  cum <- cumsum(cnt)                          # events with time >= u[i]
+  
+  i <- which(cum >= need)[1]
+  tau <- u[i]
+  achieved <- (n0 + cum[i]) / N
+  
+  # Apply your two-line admin censoring at tau
+  dat$Time[dat$Time >= tau] <- tau
+  dat$C_ind[dat$Time == tau] <- 0L
+  
+  list(tau = tau, achieved = achieved, dat = dat,
+       boundary_ties = cnt[i], needed = need)
+}
+
+
+res <- set_admin_cutoff(dat, target = 0.25)
+tau <- res$tau
+tau                         # the cutoff you should use
+prop.table(table(res$dat$C_ind))  # should be ≈ 0.5 for "0"
+
+sum(res$dat$Time==tau)
+prop.table(table(dat$C_ind))
+sum(dat$Time==60)

@@ -1,0 +1,155 @@
+#!/usr/bin/env Rscript
+
+# --- parse args: --M --nl --nu --eh --ed --ec --phi --setting_id ---
+parse_args <- function() {
+  a <- commandArgs(trailingOnly = TRUE)
+  kv <- sub("^--", "", a)
+  kv <- strsplit(kv, "=")
+  out <- list()
+  for (pair in kv) {
+    if (length(pair) == 1) next
+    out[[pair[[1]]]] <- pair[[2]]
+  }
+  if (length(out) == 0 && length(a) > 0) {
+    # also support "--key value" style
+    for (i in seq(1, length(a), by = 2)) {
+      key <- sub("^--", "", a[i])
+      val <- a[i + 1]
+      out[[key]] <- val
+    }
+  }
+  to_num <- function(x) as.numeric(x)
+  out$M  <- as.integer(out$M)
+  out$nl <- as.integer(out$nl)
+  out$nu <- as.integer(out$nu)
+  out$eh <- to_num(out$eh)
+  out$ed <- to_num(out$ed)
+  out$ec <- to_num(out$ec)
+  out$phi <- to_num(out$phi)
+  out$setting_id <- if (is.null(out$setting_id)) "NA" else out$setting_id
+  out
+}
+
+args <- parse_args()
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(cWR)
+})
+
+# --- config ---
+I <- 10000
+
+# ensure output dir exists
+if (!dir.exists("results")) dir.create("results", recursive = TRUE)
+
+outfile <- sprintf(
+  "results/WR_eh%s_ed%s_phi%s_nl%s_nu%s_M%s_sid%s.RData",
+  args$eh, args$ed, args$phi, args$nl, args$nu, args$M, args$setting_id
+)
+
+# --- resume support ---
+if (file.exists(outfile)) {
+  message("Found existing file: ", outfile, " -> resuming.")
+  load(outfile)  # loads Monte_out
+  if (!exists("Monte_out")) {
+    warning("Existing file didn't contain Monte_out; starting fresh.")
+    Monte_out <- data.frame()
+  }
+} else {
+  Monte_out <- data.frame()
+}
+
+# figure out where to start
+i_start <- nrow(Monte_out) + 1L
+if (i_start > I) {
+  message("All iterations already completed (nrow(Monte_out) = ", nrow(Monte_out), "). Nothing to do.")
+  quit(save = "no", status = 0)
+}
+
+message(sprintf("Starting at iteration %d of %d", i_start, I))
+
+t0 <- proc.time()[["elapsed"]]
+
+for (i in i_start:I) {
+  # deterministic seed by i => resume is consistent
+  set.seed(123 * i)
+
+  # --- simulation & analysis ---
+  data <- gen_surv(
+    M  = args$M,
+    nl = args$nl,
+    nu = args$nu,
+    fb = 7.5,
+    lh = 0.1,
+    ld = 0.08,
+    lc = 0.03,
+    eh = args$eh,
+    ed = args$ed,
+    ec = args$ec,
+    phi = args$phi
+  )
+
+  out <- WR_cal(
+    data, time = "time", event = "event",
+    cluster = "cluster", id = "id", trt = "z"
+  )
+
+  df_wide <- data %>%
+    group_by(id) %>%
+    summarize(
+      cluster = dplyr::first(cluster),
+      Nc      = dplyr::first(Nc),
+      z       = dplyr::first(z),
+      TH = if_else(any(event == 1), min(time[event == 1]),  Inf),
+      TD = if_else(any(event == 2), min(time[event == 2]),  Inf),
+      TC = if_else(any(event == 0), min(time[event == 0]),  Inf),
+      y1     = pmin(TH, TD, TC),
+      delta1 = as.integer(TH <= pmin(TD, TC)),
+      y2     = pmin(TD, TC),
+      delta2 = as.integer(TD <= TC),
+      .groups = "drop"
+    ) %>%
+    select(id, cluster, Nc, y1, delta1, y2, delta2, z)
+
+  cwr <- WR.CRT(
+    treatment = df_wide$z, cluster = df_wide$cluster,
+    y1 = df_wide$y1, y2 = df_wide$y2,
+    delta1 = df_wide$delta1, delta2 = df_wide$delta2
+  )
+
+  est <- c(unlist(out), cwr$logWR, cwr$se^2)
+
+  # ensure names match every time (protect against factors/rowbind issues)
+  nm <- c(
+    "W_D","W_R","logW_R","p_ties",
+    "p_W","p_T","p_WW","p_WT","p_TT","gamma_I",
+    "var_direct","var_theorm","logW_R_cWR","var_cWR"
+  )
+  names(est) <- nm
+  EstDF <- as.data.frame(as.list(est), optional = TRUE)
+  Monte_out <- rbind(Monte_out, EstDF)
+  names(Monte_out) <- nm
+
+  # --- save on every iteration ---
+  try({
+    save(Monte_out, file = outfile)
+  }, silent = TRUE)
+
+  # --- progress logging ---
+  if (i <= 10 || i %% 50 == 0 || i == I) {
+    elapsed <- proc.time()[["elapsed"]] - t0
+    done <- i - i_start + 1
+    total <- I - i_start + 1
+    pct <- 100 * done / total
+    # simple ETA
+    rate <- done / max(elapsed, 1e-9)
+    eta_sec <- (total - done) / max(rate, 1e-9)
+    msg <- sprintf("Iter %d/%d (%.1f%%) | elapsed %.1fs | ETA ~ %.1fs",
+                   i, I, pct, elapsed, eta_sec)
+    message(msg)
+    flush.console()
+  }
+}
+
+message("Finished. Saved ", outfile)

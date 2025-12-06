@@ -1,0 +1,46 @@
+source("composite.R")
+library(cWR)
+
+I  <- 10000
+
+Monte_out <- data.frame()
+
+for(i in 1:I){
+  
+  set.seed(52345*i)
+  data <- gen_surv(M=74, nl=20, nu=100, fb=7.5, lh=0.1, ld=0.08, lc=0.03,
+                   eh=0.3, ed=0.3, ec=0.1, phi=1)
+  out <- WR_cal(data, time="time", event="event",
+                cluster="cluster", id="id", trt="z")
+  
+  df_wide <- data %>%
+    group_by(id) %>%
+    summarize(
+      cluster = first(cluster),
+      Nc      = first(Nc),
+      z = first(z),
+      # first occ. of each type (or Inf if never occurs)
+      TH = if_else(any(event == 1), min(time[event == 1]),  Inf),
+      TD = if_else(any(event == 2), min(time[event == 2]),  Inf),
+      TC = if_else(any(event == 0), min(time[event == 0]),  Inf),
+      # build y1, delta1, y2, delta2
+      y1     = pmin(TH, TD, TC),
+      delta1 = as.integer(TH <= pmin(TD, TC)),
+      y2     = pmin(TD, TC),
+      delta2 = as.integer(TD <= TC)
+    ) %>% 
+    select(id, cluster, Nc, y1, delta1, y2, delta2,z)
+  
+  cWR <- WR.CRT(treatment = df_wide$z,cluster=df_wide$cluster,
+                y1 = df_wide$y1,y2=df_wide$y2,
+                delta1 = df_wide$delta1,delta2=df_wide$delta2)
+  
+  
+  
+  est <- c(unlist(out),cWR$logWR,cWR$se^2)
+  Monte_out <- rbind(Monte_out, est)
+  names(Monte_out) <- c("W_D","W_R","logW_R","p_ties",
+                        "p_W","p_T","p_WW","p_WT","p_TT","gamma_I",
+                        "var_direct","var_theorm","logW_R_cWR","var_cWR")
+  save(Monte_out, file="WR_eh0.3_ed0.3_phi1_nl20_nu100(4).RData")
+}

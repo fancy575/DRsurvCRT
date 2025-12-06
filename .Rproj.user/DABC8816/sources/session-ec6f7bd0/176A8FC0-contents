@@ -1,0 +1,143 @@
+#' Collate selected columns from Sc/Si summary CSVs across multiple folders
+#'
+#' @param base_dir Character. Root directory containing the folders.
+#' @param folders  Character vector of folder names to iterate over.
+#' @param include_folder Logical. Add a "Folder" column indicating source folder.
+#' @param out_prefix Character. Prefix for output file names.
+#' @param write_csv Logical. Write CSV outputs (two files).
+#' @param write_xlsx Logical. Also write a single XLSX with two sheets (requires openxlsx).
+#' @param verbose Logical. Message about missing files/columns.
+#'
+#' @return A list with two data.frames: $Sc and $Si
+multi_sum <- function(
+    base_dir = ".",
+    folders = c(
+      "correct_both", "incorrect_censor", "outcome_incorrect", "both_incorrect",
+      "correct_both_frailty", "incorrect_censor_frailty",
+      "outcome_incorrect_frailty", "both_incorrect_frailty", "rmt"
+    ),
+    include_folder = TRUE,
+    out_prefix = "multi_sum",
+    write_csv = TRUE,
+    write_xlsx = FALSE,
+    verbose = TRUE
+) {
+  keep_cols <- c(
+    "ABias_s1_sum", "SE_s1_sum", "SD_s1_sum", "CR_s1_sum",
+    "ABias_s0_sum", "SE_s0_sum", "SD_s0_sum", "CR_s0_sum",
+    "ABias_diff_sum", "SE_diff_sum", "SD_diff_sum", "CR_diff_sum"
+  )
+
+  # Find a file by regex pattern inside a folder (case-insensitive)
+  .resolve_by_pattern <- function(folder, pattern) {
+    dirpath <- file.path(base_dir, folder)
+    files <- tryCatch(
+      list.files(dirpath, pattern = pattern, full.names = TRUE, ignore.case = TRUE),
+      error = function(e) character(0)
+    )
+    if (length(files) == 0L) return(NA_character_)
+    files[1L]
+  }
+
+  # Read, select, and standardize columns
+  .read_and_select <- function(folder, pattern) {
+    path <- .resolve_by_pattern(folder, pattern)
+    if (is.na(path)) {
+      if (verbose) message(sprintf("⚠️  Missing file for folder '%s': looked for pattern /%s/", folder, pattern))
+      return(NULL)
+    }
+    df <- tryCatch(utils::read.csv(path, check.names = FALSE), error = function(e) NULL)
+    if (is.null(df)) {
+      if (verbose) message(sprintf("⚠️  Failed to read: %s", path))
+      return(NULL)
+    }
+
+    missing_cols <- setdiff(keep_cols, names(df))
+    present <- intersect(keep_cols, names(df))
+    out <- df[, present, drop = FALSE]
+
+    if (length(missing_cols)) {
+      if (verbose) {
+        message(sprintf("⚠️  In '%s', missing columns: %s", path, paste(missing_cols, collapse = ", ")))
+      }
+      for (mc in missing_cols) out[[mc]] <- NA
+      out <- out[, keep_cols, drop = FALSE]
+    } else {
+      # ensure requested order even if present
+      out <- out[, keep_cols, drop = FALSE]
+    }
+
+    if (include_folder) out <- cbind(Folder = folder, out, stringsAsFactors = FALSE)
+    out
+  }
+
+  # Patterns that match:
+  #   Sc_win_summary.csv OR Sc_win_summary_csv.csv OR Sc_win_summary (no ext) OR Sc_win_summary_csv (no ext)
+  pat_sc <- "^(Sc_win_summary)(_csv)?(\\.csv)?$"
+  pat_si <- "^(Si_win_summary)(_csv)?(\\.csv)?$"
+
+  sc_list <- lapply(folders, .read_and_select, pattern = pat_sc)
+  si_list <- lapply(folders, .read_and_select, pattern = pat_si)
+
+  sc_list <- Filter(Negate(is.null), sc_list)
+  si_list <- Filter(Negate(is.null), si_list)
+
+  final_cols <- if (include_folder) c("Folder", keep_cols) else keep_cols
+
+  Sc <- if (length(sc_list)) {
+    out <- do.call(rbind, sc_list)
+    out <- out[, final_cols, drop = FALSE]
+    rownames(out) <- NULL
+    out
+  } else {
+    setNames(data.frame(matrix(ncol = length(final_cols), nrow = 0)), final_cols)
+  }
+
+  Si <- if (length(si_list)) {
+    out <- do.call(rbind, si_list)
+    out <- out[, final_cols, drop = FALSE]
+    rownames(out) <- NULL
+    out
+  } else {
+    setNames(data.frame(matrix(ncol = length(final_cols), nrow = 0)), final_cols)
+  }
+
+  if (write_csv) {
+    utils::write.csv(Sc, file.path(base_dir, paste0(out_prefix, "_Sc.csv")), row.names = FALSE)
+    utils::write.csv(Si, file.path(base_dir, paste0(out_prefix, "_Si.csv")), row.names = FALSE)
+  }
+
+  if (write_xlsx) {
+    if (!requireNamespace("openxlsx", quietly = TRUE)) {
+      warning("openxlsx not installed; skipping .xlsx output")
+    } else {
+      openxlsx::write.xlsx(
+        list(Sc = Sc, Si = Si),
+        file = file.path(base_dir, paste0(out_prefix, ".xlsx")),
+        asTable = TRUE
+      )
+    }
+  }
+
+  invisible(list(Sc = Sc, Si = Si))
+}
+
+
+# Run from the directory that contains the nine folders
+res <- multi_sum(
+  base_dir = "~/Research/CRT_multi/CRT/v6",
+  folders = c(
+    "correct_both", "incorrect_censor", "outcom_incorrect", "both_incorrect",
+    "correct_both_frailty", "incorrect_censor_frailty",
+    "outcom_incorrect_frailty", "both_incorrect_frailty", "rmt"
+  ),
+  out_prefix = "all_summaries",
+  write_csv = TRUE,
+  write_xlsx = TRUE
+)
+
+# Access in-memory data.frames:
+head(res$Sc)
+head(res$Si)
+
+

@@ -1,0 +1,33 @@
+source("DR_win_var.R")
+
+DR_sw_win_cal <- function(surv_dt, etime="obs_T",status = "Delta",
+                          id = "id",
+                          trt = "A",
+                          censor_cov=c("W1","W2","Z1","Z2"), ## covariates for censoring probability
+                          surv_cov=c("W1","W2","Z1","Z2"), ## covariates for probability in augmentation
+                          strata="M",tau){
+  prop <- surv_dt %>%
+    group_by(.data[[strata]]) %>%
+    slice(1) %>%  # Extract the first observation per strata
+    ungroup() %>%
+    summarize(
+      prop1 = mean(.data[[trt]] == 1),
+      prop0 = mean(.data[[trt]] == 0)
+    ) %>% as.data.frame()                          
+
+  ## calculate the estimate
+  
+  stage_est <- DR_win_est(surv_dt, etime,status,id,trt,censor_cov,surv_cov,
+                          strata, prop$prop1, prop$prop0,
+                          tau)
+  ## calculate variance
+  
+  stage_var <- DR_win_var(surv_dt, etime,status,id,trt,censor_cov,surv_cov,
+                          strata, prop$prop1, prop$prop0,
+                          tau)
+  
+  
+  return(list(est=stage_est,var=stage_var))
+  
+  
+}
