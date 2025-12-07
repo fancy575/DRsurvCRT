@@ -380,7 +380,7 @@ plot(fit_multi, type = "rmtif", level = "cluster", tau = 10)
 
 If you use **DRsurvCRT** in your work, please cite it as:
 
-> Fang, F. (2025). *DRsurvCRT: Doubly Robust Estimation for Survival Outcomes in Cluster Randomized Trials*. R package version 0.1.0.
+> Fang et al. (2025). *DRsurvCRT: Doubly Robust Estimation for Survival Outcomes in Cluster Randomized Trials*. R package version 0.1.0.
 
 ---
 
